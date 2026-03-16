@@ -1,6 +1,8 @@
 """
-Admin gRPC-сервис мастера для UI и внешних инструментов (ListWorkers).
+Admin gRPC-сервис мастера для UI и внешних инструментов (ListWorkers, LoadModel).
 """
+from __future__ import annotations
+
 from __future__ import annotations
 
 import grpc
@@ -8,7 +10,6 @@ import grpc
 from cluster_core.common.types import WorkerDescriptor, WorkerStatus
 from cluster_core.master.worker_registry import WorkerRegistry
 from cluster_core.grpc import cluster_pb2, cluster_pb2_grpc
-
 
 _STATUS_TO_PROTO = {
     WorkerStatus.ONLINE: cluster_pb2.WORKER_STATUS_ONLINE,
@@ -46,10 +47,11 @@ def _worker_descriptor_to_proto(wd: WorkerDescriptor) -> cluster_pb2.WorkerDescr
 
 
 class MasterAdminService(cluster_pb2_grpc.MasterAdminServiceServicer):
-    """Сервис админ-API мастера: список воркеров для UI."""
+    """Сервис админ-API мастера: список воркеров, загрузка модели."""
 
-    def __init__(self, registry: WorkerRegistry) -> None:
+    def __init__(self, registry: WorkerRegistry, master_node: object = None) -> None:
         self._registry = registry
+        self._master_node = master_node
 
     def ListWorkers(
         self,
@@ -61,3 +63,15 @@ class MasterAdminService(cluster_pb2_grpc.MasterAdminServiceServicer):
             for wd in self._registry.all().values()
         ]
         return cluster_pb2.WorkerList(workers=workers)
+
+    def LoadModel(
+        self,
+        request: cluster_pb2.LoadModelRequest,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.LoadModelResponse:
+        if not request.hf_model_id or not request.hf_model_id.strip():
+            return cluster_pb2.LoadModelResponse(ok=False, error="Укажите hf_model_id")
+        if self._master_node is None:
+            return cluster_pb2.LoadModelResponse(ok=False, error="Мастер не готов к загрузке модели")
+        ok, err = self._master_node.load_model(request.hf_model_id.strip())
+        return cluster_pb2.LoadModelResponse(ok=ok, error=err or "")

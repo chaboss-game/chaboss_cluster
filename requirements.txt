@@ -2,7 +2,11 @@ grpcio==1.68.0
 grpcio-tools==1.68.0
 torch
 transformers
+huggingface_hub
+safetensors
 PyYAML
 psutil
 PyQt6
 loguru
+fastapi
+uvicorn[standard]

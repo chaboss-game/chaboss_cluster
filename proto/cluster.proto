@@ -93,6 +93,8 @@ message StageRequest {
   string request_id = 1;
   TensorPayload tensor = 2;
   bool is_last = 3;
+  string model_id = 4;   // для выбора модуля на воркере
+  string shard_id = 5;
 }
 
 message StageResponse {
@@ -119,7 +121,17 @@ message WorkerList {
   repeated WorkerDescriptor workers = 1;
 }
 
+message LoadModelRequest {
+  string hf_model_id = 1;  // e.g. "bert-base-uncased" or "org/repo"
+}
+
+message LoadModelResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 service MasterAdminService {
   rpc ListWorkers(Empty) returns (WorkerList);
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
 }
 

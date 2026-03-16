@@ -24,15 +24,15 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rcluster.proto\x12\x07\x63luster\"&\n\x08WorkerId\x12\x0c\n\x04host\x18\x01 \x01(\t\x12\x0c\n\x04port\x18\x02 \x01(\x05\"j\n\x07GpuInfo\x12\r\n\x05index\x18\x01 \x01(\x05\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x15\n\rtotal_vram_mb\x18\x03 \x01(\x05\x12\x1a\n\x12\x63ompute_capability\x18\x04 \x01(\t\x12\x0f\n\x07\x62\x61\x63kend\x18\x05 \x01(\t\"\xb4\x01\n\x0cResourceInfo\x12\x11\n\tcpu_cores\x18\x01 \x01(\x05\x12\x14\n\x0cram_total_mb\x18\x02 \x01(\x05\x12\x18\n\x10ram_available_mb\x18\x03 \x01(\x05\x12\x1e\n\x04gpus\x18\x04 \x03(\x0b\x32\x10.cluster.GpuInfo\x12\x15\n\rtorch_version\x18\x05 \x01(\t\x12\x14\n\x0c\x63uda_version\x18\x06 \x01(\t\x12\x14\n\x0crocm_version\x18\x07 \x01(\t\"\x82\x01\n\x10WorkerDescriptor\x12\x1d\n\x02id\x18\x01 \x01(\x0b\x32\x11.cluster.WorkerId\x12%\n\x06status\x18\x02 \x01(\x0e\x32\x15.cluster.WorkerStatus\x12(\n\tresources\x18\x03 \x01(\x0b\x32\x15.cluster.ResourceInfo\":\n\nTensorMeta\x12\r\n\x05\x64type\x18\x01 \x01(\t\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\x0e\n\x06\x64\x65vice\x18\x03 \x01(\t\"@\n\rTensorPayload\x12!\n\x04meta\x18\x01 \x01(\x0b\x32\x13.cluster.TensorMeta\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\"@\n\tShardSpec\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x10\n\x08shard_id\x18\x02 \x01(\t\x12\x0f\n\x07\x62\x61\x63kend\x18\x03 \x01(\t\"\x8c\x01\n\x10InitShardRequest\x12 \n\x04spec\x18\x01 \x01(\x0b\x32\x12.cluster.ShardSpec\x12\x15\n\rweight_source\x18\x02 \x01(\t\x12\x15\n\rhf_model_name\x18\x03 \x01(\t\x12\x13\n\x0bshared_path\x18\x04 \x01(\t\x12\x13\n\x0binline_blob\x18\x05 \x01(\x0c\".\n\x11InitShardResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t\":\n\nHealthPing\x12\x1d\n\x02id\x18\x01 \x01(\x0b\x32\x11.cluster.WorkerId\x12\r\n\x05nonce\x18\x02 \x01(\t\"a\n\nHealthPong\x12\x1d\n\x02id\x18\x01 \x01(\x0b\x32\x11.cluster.WorkerId\x12\r\n\x05nonce\x18\x02 \x01(\t\x12%\n\x06status\x18\x03 \x01(\x0e\x32\x15.cluster.WorkerStatus\"[\n\x0cStageRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12&\n\x06tensor\x18\x02 \x01(\x0b\x32\x16.cluster.TensorPayload\x12\x0f\n\x07is_last\x18\x03 \x01(\x08\"k\n\rStageResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12&\n\x06tensor\x18\x02 \x01(\x0b\x32\x16.cluster.TensorPayload\x12\x0f\n\x07is_last\x18\x03 \x01(\x08\x12\r\n\x05\x65rror\x18\x04 \x01(\t\"\x07\n\x05\x45mpty\"8\n\nWorkerList\x12*\n\x07workers\x18\x01 \x03(\x0b\x32\x19.cluster.WorkerDescriptor*\x7f\n\x0cWorkerStatus\x12\x18\n\x14WORKER_STATUS_ONLINE\x10\x00\x12\x19\n\x15WORKER_STATUS_OFFLINE\x10\x01\x12\x1a\n\x16WORKER_STATUS_UNSTABLE\x10\x02\x12\x1e\n\x1aWORKER_STATUS_RECONNECTING\x10\x03\x32\x8b\x02\n\rWorkerService\x12\x39\n\tGetStatus\x12\x11.cluster.WorkerId\x1a\x19.cluster.WorkerDescriptor\x12\x42\n\tInitShard\x12\x19.cluster.InitShardRequest\x1a\x1a.cluster.InitShardResponse\x12=\n\x08RunStage\x12\x15.cluster.StageRequest\x1a\x16.cluster.StageResponse(\x01\x30\x01\x12<\n\x0cHealthStream\x12\x13.cluster.HealthPing\x1a\x13.cluster.HealthPong(\x01\x30\x01\x32H\n\x12MasterAdminService\x12\x32\n\x0bListWorkers\x12\x0e.cluster.Empty\x1a\x13.cluster.WorkerListb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rcluster.proto\x12\x07\x63luster\"&\n\x08WorkerId\x12\x0c\n\x04host\x18\x01 \x01(\t\x12\x0c\n\x04port\x18\x02 \x01(\x05\"j\n\x07GpuInfo\x12\r\n\x05index\x18\x01 \x01(\x05\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x15\n\rtotal_vram_mb\x18\x03 \x01(\x05\x12\x1a\n\x12\x63ompute_capability\x18\x04 \x01(\t\x12\x0f\n\x07\x62\x61\x63kend\x18\x05 \x01(\t\"\xb4\x01\n\x0cResourceInfo\x12\x11\n\tcpu_cores\x18\x01 \x01(\x05\x12\x14\n\x0cram_total_mb\x18\x02 \x01(\x05\x12\x18\n\x10ram_available_mb\x18\x03 \x01(\x05\x12\x1e\n\x04gpus\x18\x04 \x03(\x0b\x32\x10.cluster.GpuInfo\x12\x15\n\rtorch_version\x18\x05 \x01(\t\x12\x14\n\x0c\x63uda_version\x18\x06 \x01(\t\x12\x14\n\x0crocm_version\x18\x07 \x01(\t\"\x82\x01\n\x10WorkerDescriptor\x12\x1d\n\x02id\x18\x01 \x01(\x0b\x32\x11.cluster.WorkerId\x12%\n\x06status\x18\x02 \x01(\x0e\x32\x15.cluster.WorkerStatus\x12(\n\tresources\x18\x03 \x01(\x0b\x32\x15.cluster.ResourceInfo\":\n\nTensorMeta\x12\r\n\x05\x64type\x18\x01 \x01(\t\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\x0e\n\x06\x64\x65vice\x18\x03 \x01(\t\"@\n\rTensorPayload\x12!\n\x04meta\x18\x01 \x01(\x0b\x32\x13.cluster.TensorMeta\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\"@\n\tShardSpec\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x10\n\x08shard_id\x18\x02 \x01(\t\x12\x0f\n\x07\x62\x61\x63kend\x18\x03 \x01(\t\"\x8c\x01\n\x10InitShardRequest\x12 \n\x04spec\x18\x01 \x01(\x0b\x32\x12.cluster.ShardSpec\x12\x15\n\rweight_source\x18\x02 \x01(\t\x12\x15\n\rhf_model_name\x18\x03 \x01(\t\x12\x13\n\x0bshared_path\x18\x04 \x01(\t\x12\x13\n\x0binline_blob\x18\x05 \x01(\x0c\".\n\x11InitShardResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t\":\n\nHealthPing\x12\x1d\n\x02id\x18\x01 \x01(\x0b\x32\x11.cluster.WorkerId\x12\r\n\x05nonce\x18\x02 \x01(\t\"a\n\nHealthPong\x12\x1d\n\x02id\x18\x01 \x01(\x0b\x32\x11.cluster.WorkerId\x12\r\n\x05nonce\x18\x02 \x01(\t\x12%\n\x06status\x18\x03 \x01(\x0e\x32\x15.cluster.WorkerStatus\"\x7f\n\x0cStageRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12&\n\x06tensor\x18\x02 \x01(\x0b\x32\x16.cluster.TensorPayload\x12\x0f\n\x07is_last\x18\x03 \x01(\x08\x12\x10\n\x08model_id\x18\x04 \x01(\t\x12\x10\n\x08shard_id\x18\x05 \x01(\t\"k\n\rStageResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12&\n\x06tensor\x18\x02 \x01(\x0b\x32\x16.cluster.TensorPayload\x12\x0f\n\x07is_last\x18\x03 \x01(\x08\x12\r\n\x05\x65rror\x18\x04 \x01(\t\"\x07\n\x05\x45mpty\"8\n\nWorkerList\x12*\n\x07workers\x18\x01 \x03(\x0b\x32\x19.cluster.WorkerDescriptor\"\'\n\x10LoadModelRequest\x12\x13\n\x0bhf_model_id\x18\x01 \x01(\t\".\n\x11LoadModelResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t*\x7f\n\x0cWorkerStatus\x12\x18\n\x14WORKER_STATUS_ONLINE\x10\x00\x12\x19\n\x15WORKER_STATUS_OFFLINE\x10\x01\x12\x1a\n\x16WORKER_STATUS_UNSTABLE\x10\x02\x12\x1e\n\x1aWORKER_STATUS_RECONNECTING\x10\x03\x32\x8b\x02\n\rWorkerService\x12\x39\n\tGetStatus\x12\x11.cluster.WorkerId\x1a\x19.cluster.WorkerDescriptor\x12\x42\n\tInitShard\x12\x19.cluster.InitShardRequest\x1a\x1a.cluster.InitShardResponse\x12=\n\x08RunStage\x12\x15.cluster.StageRequest\x1a\x16.cluster.StageResponse(\x01\x30\x01\x12<\n\x0cHealthStream\x12\x13.cluster.HealthPing\x1a\x13.cluster.HealthPong(\x01\x30\x01\x32\x8c\x01\n\x12MasterAdminService\x12\x32\n\x0bListWorkers\x12\x0e.cluster.Empty\x1a\x13.cluster.WorkerList\x12\x42\n\tLoadModel\x12\x19.cluster.LoadModelRequest\x1a\x1a.cluster.LoadModelResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'cluster_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_WORKERSTATUS']._serialized_start=1301
-  _globals['_WORKERSTATUS']._serialized_end=1428
+  _globals['_WORKERSTATUS']._serialized_start=1426
+  _globals['_WORKERSTATUS']._serialized_end=1553
   _globals['_WORKERID']._serialized_start=26
   _globals['_WORKERID']._serialized_end=64
   _globals['_GPUINFO']._serialized_start=66
@@ -56,15 +56,19 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_HEALTHPONG']._serialized_start=933
   _globals['_HEALTHPONG']._serialized_end=1030
   _globals['_STAGEREQUEST']._serialized_start=1032
-  _globals['_STAGEREQUEST']._serialized_end=1123
-  _globals['_STAGERESPONSE']._serialized_start=1125
-  _globals['_STAGERESPONSE']._serialized_end=1232
-  _globals['_EMPTY']._serialized_start=1234
-  _globals['_EMPTY']._serialized_end=1241
-  _globals['_WORKERLIST']._serialized_start=1243
-  _globals['_WORKERLIST']._serialized_end=1299
-  _globals['_WORKERSERVICE']._serialized_start=1431
-  _globals['_WORKERSERVICE']._serialized_end=1698
-  _globals['_MASTERADMINSERVICE']._serialized_start=1700
-  _globals['_MASTERADMINSERVICE']._serialized_end=1772
+  _globals['_STAGEREQUEST']._serialized_end=1159
+  _globals['_STAGERESPONSE']._serialized_start=1161
+  _globals['_STAGERESPONSE']._serialized_end=1268
+  _globals['_EMPTY']._serialized_start=1270
+  _globals['_EMPTY']._serialized_end=1277
+  _globals['_WORKERLIST']._serialized_start=1279
+  _globals['_WORKERLIST']._serialized_end=1335
+  _globals['_LOADMODELREQUEST']._serialized_start=1337
+  _globals['_LOADMODELREQUEST']._serialized_end=1376
+  _globals['_LOADMODELRESPONSE']._serialized_start=1378
+  _globals['_LOADMODELRESPONSE']._serialized_end=1424
+  _globals['_WORKERSERVICE']._serialized_start=1556
+  _globals['_WORKERSERVICE']._serialized_end=1823
+  _globals['_MASTERADMINSERVICE']._serialized_start=1826
+  _globals['_MASTERADMINSERVICE']._serialized_end=1966
 # @@protoc_insertion_point(module_scope)

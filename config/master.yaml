@@ -1,6 +1,11 @@
 listen_host: "0.0.0.0"
 listen_port: 60051
 
+# OpenAI-совместимый HTTP API (для OpenCLaw и др.)
+http_listen_host: "0.0.0.0"
+http_listen_port: 8055
+# openai_api_key: "sk-..."  # опционально; если задан — проверка Authorization: Bearer <key>
+
 parallel_backend: "baseline"  # baseline | accelerate | deepspeed
 
 # Initial static list of workers.

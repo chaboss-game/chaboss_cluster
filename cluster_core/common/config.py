@@ -20,6 +20,10 @@ class MasterConfig:
     listen_port: int
     workers: List[WorkerConfig]
     parallel_backend: str = "baseline"  # baseline | accelerate | deepspeed
+    # OpenAI-совместимый HTTP API
+    http_listen_host: str = "0.0.0.0"
+    http_listen_port: int = 8055
+    openai_api_key: str | None = None  # опционально; если задан — проверка заголовка Authorization
 
 
 def load_master_config(path: str | Path) -> MasterConfig:
@@ -37,6 +41,9 @@ def load_master_config(path: str | Path) -> MasterConfig:
         listen_port=int(data.get("listen_port", 50051)),
         workers=workers,
         parallel_backend=data.get("parallel_backend", "baseline"),
+        http_listen_host=data.get("http_listen_host", "0.0.0.0"),
+        http_listen_port=int(data.get("http_listen_port", 8055)),
+        openai_api_key=data.get("openai_api_key") or None,
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 from concurrent import futures
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from cluster_core.master.worker_registry import WorkerRegistry
 from cluster_core.master.master_node import MasterNode
 from cluster_core.master.admin_service import MasterAdminService
 from cluster_core.grpc import cluster_pb2_grpc
+from cluster_core.api.openai_http import create_app
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,13 +40,29 @@ def main() -> None:
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     cluster_pb2_grpc.add_MasterAdminServiceServicer_to_server(
-        MasterAdminService(registry), server
+        MasterAdminService(registry, master_node), server
     )
 
     listen_addr = f"{cfg.listen_host}:{cfg.listen_port}"
     server.add_insecure_port(listen_addr)
     logger.info("Starting master on %s", listen_addr)
     server.start()
+
+    # OpenAI-совместимый HTTP API в фоновом потоке
+    http_app = create_app(registry, master_node, cfg)
+
+    def run_http() -> None:
+        import uvicorn
+        uvicorn.run(
+            http_app,
+            host=cfg.http_listen_host,
+            port=cfg.http_listen_port,
+            log_level="info",
+        )
+
+    http_thread = threading.Thread(target=run_http, daemon=True)
+    http_thread.start()
+    logger.info("OpenAI HTTP API on http://%s:%s", cfg.http_listen_host, cfg.http_listen_port)
 
     # Стартуем управление воркерами в фоне.
     master_node.start_background()

@@ -210,9 +210,15 @@ python -m scripts.run_master --config config/master.yaml
 ```
 
 Мастер:
-- поднимет свой gRPC‑сервер (для последующего admin/external API),
-- попробует подключиться к каждому воркеру из `master.yaml`,
-- выполнит `GetStatus` и сохранит данные о ресурсах в реестре.
+- поднимет gRPC‑сервер (admin API, воркеры),
+- запустит **OpenAI-совместимый HTTP API** на порту `8055` (см. `http_listen_port` в конфиге),
+- подключится к воркерам из `master.yaml`, выполнит `GetStatus` и сохранит данные в реестре.
+
+**OpenAI HTTP API** (для OpenCLaw и др.):
+- `GET /v1/models` — список моделей (последняя загруженная через UI/LoadModel),
+- `POST /v1/chat/completions` — чат (пока заглушка; далее — pipeline по воркерам),
+- `POST /v1/completions` — текстовое завершение (заглушка),
+- Опционально в `master.yaml`: `openai_api_key: "sk-..."` — проверка заголовка `Authorization: Bearer <key>`.
 
 ---
 
@@ -251,4 +257,39 @@ UI каждые 3 с опрашивает мастер (ListWorkers) и пока
 - **Docker и оркестрация**:
   - Docker‑образы для мастера и воркеров (с поддержкой GPU),
   - docker‑compose / Kubernetes‑манифесты.
+
+---
+
+### 8. Что уже сделано и что осталось по плану
+
+**Уже сделано:**
+- gRPC‑протокол master ↔ worker (GetStatus, InitShard, RunStage, HealthStream); в StageRequest передаются model_id и shard_id.
+- Воркеры: сбор ресурсов (CPU/RAM/GPU), приём шардов (inline_blob, shared_path, hf), сборка BERT‑слоёв из шарда (BertLayer), RunStage с реальным forward по модулю или identity.
+- Мастер: реестр воркеров, HealthStream + автопереподключение с backoff, загрузка модели с HF и рассылка шардов (LoadModel); для BERT‑подобных — разбиение по слоям (encoder.layer.i), иначе round‑robin; run_pipeline с передачей model_id/shard_id.
+- Admin API: ListWorkers, LoadModel.
+- OpenAI‑совместимый HTTP API на порту 8055: /v1/models, /v1/chat/completions, /v1/completions; при загруженной модели chat/completions вызывает run_pipeline (пока с тестовым тензором из промпта).
+- PyQt6 UI: вкладки Воркеры/Настройки, конфиг воркеров (IP, port, key), модель HF, Скан/Старт, автосохранение настроек.
+
+**Осталось по плану:**
+
+1. **Расширение forward на воркерах**  
+   Реализован forward для BERT‑подобных (encoder.layer): на воркере собирается Sequential из BertLayer по state_dict шарда. Осталось: поддержка других архитектур (GPT‑2, LLaMA и т.д.), разбиение по слоям для них.
+
+2. **Токенизация и декодирование в HTTP API**  
+   В /v1/chat/completions вместо тестового тензора из промпта: токенизатор модели → input_ids/embeddings → run_pipeline → декодер → текст ответа. Требуется привязка к конкретному типу модели (или универсальный путь через transformers).
+
+3. **Backend’ы accelerate / deepspeed**  
+   Реализовать альтернативные варианты шардирования и инференса (accelerate для точности, deepspeed для скорости), выбор в конфиге или по модели.
+
+4. **Оптимизация передачи тензоров**  
+   Варианты: общий storage (NFS/SMB) для весов вместо inline_blob; прямые каналы воркер↔воркер; опционально torch.distributed.rpc / TensorPipe для быстрого обмена тензорами в локальной сети.
+
+5. **Управление шардами по требованию**  
+   Выгрузка/загрузка шардов по запросу (lazy load/unload), освобождение VRAM при простое, повторный cold start при смене модели.
+
+6. **Применение конфига воркеров из UI на мастере**  
+   Сейчас список воркеров (IP, port, key) только хранится в настройках GUI. Нужен RPC или механизм, чтобы мастер подхватывал этот список (например, UpdateWorkersConfig) без перезапуска или с перезапуском.
+
+7. **Docker и оркестрация**  
+   Образы для мастера и воркеров (с поддержкой GPU), docker‑compose, при необходимости — манифесты для Kubernetes.
 
