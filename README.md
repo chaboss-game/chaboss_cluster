@@ -144,6 +144,8 @@ python -m grpc_tools.protoc \
 
 2. **Запустить воркера**:
 
+   - Note: In this instructions we use server workspace with name of user "chaboss" and path to base project dir like "work/python/chaboss_cluster" in result we have relevant path like "/home/chaboss/work/python/chaboss_cluster". You neet to change it to your path of your project location
+
    - Linux (Kubuntu/Ubuntu):
 
    ```bash
