@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package cluster;
+
+option python_package = "cluster_core.grpc";
+
+// Basic types
+
+message WorkerId {
+  string host = 1;
+  int32 port = 2;
+}
+
+enum WorkerStatus {
+  WORKER_STATUS_ONLINE = 0;
+  WORKER_STATUS_OFFLINE = 1;
+  WORKER_STATUS_UNSTABLE = 2;
+  WORKER_STATUS_RECONNECTING = 3;
+}
+
+message GpuInfo {
+  int32 index = 1;
+  string name = 2;
+  int32 total_vram_mb = 3;
+  string compute_capability = 4;
+  string backend = 5; // cuda | rocm | other
+}
+
+message ResourceInfo {
+  int32 cpu_cores = 1;
+  int32 ram_total_mb = 2;
+  int32 ram_available_mb = 3;
+  repeated GpuInfo gpus = 4;
+  string torch_version = 5;
+  string cuda_version = 6;
+  string rocm_version = 7;
+}
+
+message WorkerDescriptor {
+  WorkerId id = 1;
+  WorkerStatus status = 2;
+  ResourceInfo resources = 3;
+}
+
+// Tensor transport
+
+message TensorMeta {
+  string dtype = 1;
+  repeated int64 shape = 2;
+  string device = 3;
+}
+
+message TensorPayload {
+  TensorMeta meta = 1;
+  bytes data = 2;
+}
+
+// Sharding
+
+message ShardSpec {
+  string model_id = 1;
+  string shard_id = 2;
+  string backend = 3; // baseline | accelerate | deepspeed
+}
+
+message InitShardRequest {
+  ShardSpec spec = 1;
+  string weight_source = 2; // hf | shared_path | inline_blob
+  string hf_model_name = 3;
+  string shared_path = 4;
+  bytes inline_blob = 5;
+}
+
+message InitShardResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// Health / heartbeat
+
+message HealthPing {
+  WorkerId id = 1;
+  string nonce = 2;
+}
+
+message HealthPong {
+  WorkerId id = 1;
+  string nonce = 2;
+  WorkerStatus status = 3;
+}
+
+// Pipeline execution
+
+message StageRequest {
+  string request_id = 1;
+  TensorPayload tensor = 2;
+  bool is_last = 3;
+}
+
+message StageResponse {
+  string request_id = 1;
+  TensorPayload tensor = 2;
+  bool is_last = 3;
+  string error = 4;
+}
+
+// Worker-side service, called by master.
+
+service WorkerService {
+  rpc GetStatus(WorkerId) returns (WorkerDescriptor);
+  rpc InitShard(InitShardRequest) returns (InitShardResponse);
+  rpc RunStage(stream StageRequest) returns (stream StageResponse);
+  rpc HealthStream(stream HealthPing) returns (stream HealthPong);
+}
+

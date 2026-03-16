@@ -1,0 +1,8 @@
+grpcio==1.68.0
+grpcio-tools==1.68.0
+torch
+transformers
+PyYAML
+psutil
+PyQt6
+loguru

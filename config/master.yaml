@@ -1,0 +1,11 @@
+listen_host: "0.0.0.0"
+listen_port: 60051
+
+parallel_backend: "baseline"  # baseline | accelerate | deepspeed
+
+# Initial static list of workers.
+workers:
+  - host: "127.0.0.1"
+    port: 60052
+    auth_token: null
+

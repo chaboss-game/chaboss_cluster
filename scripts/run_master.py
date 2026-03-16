@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+import argparse
+import logging
+from concurrent import futures
+from pathlib import Path
+
+import grpc
+
+from cluster_core.common.config import load_master_config
+from cluster_core.master.worker_registry import WorkerRegistry
+from cluster_core.master.master_node import MasterNode
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run master node.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config/master.yaml",
+        help="Path to master configuration file.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config_path = Path(args.config)
+    cfg = load_master_config(config_path)
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("master")
+
+    registry = WorkerRegistry()
+    master_node = MasterNode(cfg, registry)
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+
+    # TODO: register gRPC services (admin / external API) when implemented.
+
+    listen_addr = f"{cfg.listen_host}:{cfg.listen_port}"
+    server.add_insecure_port(listen_addr)
+    logger.info("Starting master on %s", listen_addr)
+    server.start()
+
+    # Стартуем управление воркерами в фоне.
+    master_node.start_background()
+
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("Shutting down master...")
+        master_node.stop()
+        server.stop(grace=None)
+
+
+if __name__ == "__main__":
+    main()
+
