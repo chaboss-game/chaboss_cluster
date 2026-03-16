@@ -3,13 +3,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import uuid
-from typing import Dict, Iterable
+from typing import Dict
 
 import grpc
 
 from cluster_core.common.config import MasterConfig, WorkerConfig
-from cluster_core.common.types import ResourceInfo, WorkerDescriptor, WorkerId, WorkerStatus
+from cluster_core.common.types import GpuInfo, ResourceInfo, WorkerDescriptor, WorkerId, WorkerStatus
 from cluster_core.master.worker_registry import WorkerRegistry
 from cluster_core.grpc import cluster_pb2, cluster_pb2_grpc
 
@@ -76,11 +75,21 @@ class MasterNode:
             self._registry.upsert(wd)
             return
 
+        gpus = [
+            GpuInfo(
+                index=g.index,
+                name=g.name,
+                total_vram_mb=g.total_vram_mb,
+                compute_capability=g.compute_capability or None,
+                backend=g.backend or "cuda",
+            )
+            for g in desc.resources.gpus
+        ]
         resources = ResourceInfo(
             cpu_cores=desc.resources.cpu_cores,
             ram_total_mb=desc.resources.ram_total_mb,
             ram_available_mb=desc.resources.ram_available_mb,
-            gpus=[],
+            gpus=gpus,
             torch_version=desc.resources.torch_version or None,
             cuda_version=desc.resources.cuda_version or None,
             rocm_version=desc.resources.rocm_version or None,

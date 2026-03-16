@@ -1,12 +1,8 @@
 """
-Generated gRPC Python modules will live in this package.
+Сгенерированные gRPC-модули (cluster_pb2, cluster_pb2_grpc).
 
-Generate them with:
-
-  python -m grpc_tools.protoc \
-    -I proto \
-    --python_out=cluster_core/grpc \
-    --grpc_python_out=cluster_core/grpc \
-    proto/cluster.proto
+Перед первым запуском выполните из корня проекта:
+  pip install -r requirements.txt
+  python scripts/gen_grpc.py
 """
 

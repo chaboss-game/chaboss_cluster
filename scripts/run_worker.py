@@ -36,7 +36,7 @@ def main() -> None:
     worker_service = WorkerService(host=host, port=port)
     from cluster_core.grpc import cluster_pb2_grpc
 
-    cluster_pb2_grpc.WorkerServiceServicer_to_server(worker_service, server)
+    cluster_pb2_grpc.add_WorkerServiceServicer_to_server(worker_service, server)
 
     listen_addr = f"{host}:{port}"
     server.add_insecure_port(listen_addr)

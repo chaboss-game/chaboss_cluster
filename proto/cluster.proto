@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package cluster;
 
-option python_package = "cluster_core.grpc";
-
 // Basic types
 
 message WorkerId {
@@ -111,5 +109,17 @@ service WorkerService {
   rpc InitShard(InitShardRequest) returns (InitShardResponse);
   rpc RunStage(stream StageRequest) returns (stream StageResponse);
   rpc HealthStream(stream HealthPing) returns (stream HealthPong);
+}
+
+// Admin API (master-side), for UI and external tools.
+
+message Empty {}
+
+message WorkerList {
+  repeated WorkerDescriptor workers = 1;
+}
+
+service MasterAdminService {
+  rpc ListWorkers(Empty) returns (WorkerList);
 }
 

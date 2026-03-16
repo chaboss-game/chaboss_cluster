@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import psutil
-import socket
 from typing import Iterator
 
 import grpc

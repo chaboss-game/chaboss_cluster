@@ -10,6 +10,8 @@ import grpc
 from cluster_core.common.config import load_master_config
 from cluster_core.master.worker_registry import WorkerRegistry
 from cluster_core.master.master_node import MasterNode
+from cluster_core.master.admin_service import MasterAdminService
+from cluster_core.grpc import cluster_pb2_grpc
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,8 +37,9 @@ def main() -> None:
     master_node = MasterNode(cfg, registry)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-
-    # TODO: register gRPC services (admin / external API) when implemented.
+    cluster_pb2_grpc.add_MasterAdminServiceServicer_to_server(
+        MasterAdminService(registry), server
+    )
 
     listen_addr = f"{cfg.listen_host}:{cfg.listen_port}"
     server.add_insecure_port(listen_addr)
