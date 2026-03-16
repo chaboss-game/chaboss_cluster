@@ -130,8 +130,24 @@ message LoadModelResponse {
   string error = 2;
 }
 
+message WorkerEndpoint {
+  string host = 1;
+  int32 port = 2;
+  string auth_token = 3;
+}
+
+message UpdateWorkersConfigRequest {
+  repeated WorkerEndpoint workers = 1;
+}
+
+message UpdateWorkersConfigResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 service MasterAdminService {
   rpc ListWorkers(Empty) returns (WorkerList);
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UpdateWorkersConfig(UpdateWorkersConfigRequest) returns (UpdateWorkersConfigResponse);
 }
 

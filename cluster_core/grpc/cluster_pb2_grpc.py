@@ -251,6 +251,11 @@ class MasterAdminServiceStub(object):
                 request_serializer=cluster__pb2.LoadModelRequest.SerializeToString,
                 response_deserializer=cluster__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
+        self.UpdateWorkersConfig = channel.unary_unary(
+                '/cluster.MasterAdminService/UpdateWorkersConfig',
+                request_serializer=cluster__pb2.UpdateWorkersConfigRequest.SerializeToString,
+                response_deserializer=cluster__pb2.UpdateWorkersConfigResponse.FromString,
+                _registered_method=True)
 
 
 class MasterAdminServiceServicer(object):
@@ -268,6 +273,12 @@ class MasterAdminServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UpdateWorkersConfig(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MasterAdminServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -280,6 +291,11 @@ def add_MasterAdminServiceServicer_to_server(servicer, server):
                     servicer.LoadModel,
                     request_deserializer=cluster__pb2.LoadModelRequest.FromString,
                     response_serializer=cluster__pb2.LoadModelResponse.SerializeToString,
+            ),
+            'UpdateWorkersConfig': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateWorkersConfig,
+                    request_deserializer=cluster__pb2.UpdateWorkersConfigRequest.FromString,
+                    response_serializer=cluster__pb2.UpdateWorkersConfigResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -336,6 +352,33 @@ class MasterAdminService(object):
             '/cluster.MasterAdminService/LoadModel',
             cluster__pb2.LoadModelRequest.SerializeToString,
             cluster__pb2.LoadModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateWorkersConfig(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/UpdateWorkersConfig',
+            cluster__pb2.UpdateWorkersConfigRequest.SerializeToString,
+            cluster__pb2.UpdateWorkersConfigResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -8,7 +8,7 @@ import logging
 import threading
 import time
 import uuid
-from typing import Dict
+from typing import Dict, List
 
 import grpc
 
@@ -72,11 +72,14 @@ class MasterNode:
         self._lock = threading.RLock()
         self._channels: Dict[str, grpc.Channel] = {}
         self._stubs: Dict[str, cluster_pb2_grpc.WorkerServiceStub] = {}
+        self._desired_worker_configs: Dict[str, WorkerConfig] = {}  # key -> WorkerConfig, обновляется из UI
         self._stop_event = threading.Event()
         self._last_loaded_model_id: str | None = None
 
     def start_background(self) -> None:
         """Старт: первичное подключение к воркерам и поток HealthStream для каждого из конфига."""
+        with self._lock:
+            self._desired_worker_configs = {f"{w.host}:{w.port}": w for w in self._cfg.workers}
         for w_cfg in self._cfg.workers:
             self._connect_worker(w_cfg)
 
@@ -95,11 +98,10 @@ class MasterNode:
         self._stop_event.set()
 
     def _get_worker_config(self, key: str) -> WorkerConfig | None:
-        wid = _parse_worker_id(key)
-        for w in self._cfg.workers:
-            if w.host == wid.host and w.port == wid.port:
-                return w
-        return None
+        with self._lock:
+            return self._desired_worker_configs.get(key) or next(
+                (w for w in self._cfg.workers if f"{w.host}:{w.port}" == key), None
+            )
 
     def _connect_worker(self, w_cfg: WorkerConfig) -> None:
         target = f"{w_cfg.host}:{w_cfg.port}"
@@ -163,6 +165,9 @@ class MasterNode:
 
         while not self._stop_event.is_set():
             with self._lock:
+                if worker_key not in self._desired_worker_configs:
+                    return
+            with self._lock:
                 stub = self._stubs.get(worker_key)
 
             if stub is None:
@@ -204,6 +209,46 @@ class MasterNode:
             self._registry.set_status(wid, WorkerStatus.RECONNECTING)
             time.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, RECONNECT_BACKOFF_MAX_S)
+
+    def update_workers_config(self, workers: List[WorkerConfig]) -> tuple[bool, str]:
+        """
+        Обновляет список воркеров (из UI): отключает удалённых, подключает новых.
+        Без перезапуска мастера.
+        """
+        with self._lock:
+            new_desired = {f"{w.host}:{w.port}": w for w in workers}
+            to_remove = [k for k in self._channels if k not in new_desired]
+            to_add = [(k, w_cfg) for k, w_cfg in new_desired.items() if k not in self._stubs]
+            self._desired_worker_configs = new_desired
+
+        for key in to_remove:
+            with self._lock:
+                ch = self._channels.pop(key, None)
+                self._stubs.pop(key, None)
+            if ch is not None:
+                try:
+                    ch.close()
+                except Exception:  # noqa: S110
+                    pass
+            wid = _parse_worker_id(key)
+            self._registry.set_status(wid, WorkerStatus.OFFLINE)
+            logger.info("Worker %s removed from config", key)
+
+        for key, w_cfg in to_add:
+            self._connect_worker(w_cfg)
+            with self._lock:
+                if key not in self._stubs:
+                    continue
+            t = threading.Thread(
+                target=self._health_stream_loop,
+                args=(key, w_cfg),
+                daemon=True,
+                name=f"health-{key}",
+            )
+            t.start()
+            logger.info("Started health stream for new worker %s", key)
+
+        return True, ""
 
     def load_model(self, hf_model_id: str) -> tuple[bool, str]:
         """

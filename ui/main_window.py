@@ -73,11 +73,13 @@ class MasterPoller(QtCore.QObject):
 
 class MainWindow(QtWidgets.QMainWindow):
     load_finished = QtCore.pyqtSignal(bool, str)
+    apply_workers_finished = QtCore.pyqtSignal(bool, str)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Cluster Master UI")
         self.load_finished.connect(self._on_load_finished)
+        self.apply_workers_finished.connect(self._on_apply_workers_finished)
 
         settings = load_settings()
         self._addr = (
@@ -128,10 +130,13 @@ class MainWindow(QtWidgets.QMainWindow):
         w_btn_layout = QtWidgets.QHBoxLayout()
         add_btn = QtWidgets.QPushButton("Добавить")
         remove_btn = QtWidgets.QPushButton("Удалить")
+        apply_btn = QtWidgets.QPushButton("Применить конфиг на мастере")
         add_btn.clicked.connect(self._add_worker_row)
         remove_btn.clicked.connect(self._remove_worker_row)
+        apply_btn.clicked.connect(self._on_apply_workers_config)
         w_btn_layout.addWidget(add_btn)
         w_btn_layout.addWidget(remove_btn)
+        w_btn_layout.addWidget(apply_btn)
         w_btn_layout.addStretch()
         w_layout.addWidget(self._workers_table)
         w_layout.addLayout(w_btn_layout)
@@ -240,6 +245,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_timer(self) -> None:
         threading.Thread(target=self._poller.poll, daemon=True).start()
+
+    def _on_apply_workers_config(self) -> None:
+        """Отправить конфиг воркеров на мастер (UpdateWorkersConfig)."""
+        self._apply_master_addr_from_edit()
+        self._save_settings()
+        self.statusBar().showMessage("Применение конфига воркеров...")
+
+        def do_apply():
+            try:
+                channel = grpc.insecure_channel(self._addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                workers = self._get_workers_from_table()
+                req = cluster_pb2.UpdateWorkersConfigRequest(
+                    workers=[
+                        cluster_pb2.WorkerEndpoint(
+                            host=w["host"],
+                            port=w["port"],
+                            auth_token=w.get("auth_token") or "",
+                        )
+                        for w in workers
+                    ]
+                )
+                resp = stub.UpdateWorkersConfig(req, timeout=10.0)
+                channel.close()
+                self.apply_workers_finished.emit(resp.ok, resp.error or "")
+            except Exception as e:
+                self.apply_workers_finished.emit(False, str(e))
+
+        threading.Thread(target=do_apply, daemon=True).start()
+
+    def _on_apply_workers_finished(self, ok: bool, error: str) -> None:
+        if ok:
+            self.statusBar().showMessage("Конфиг воркеров применён на мастере")
+        else:
+            self.statusBar().showMessage(f"Ошибка применения конфига: {error}")
 
     def _on_scan(self) -> None:
         self._apply_master_addr_from_edit()

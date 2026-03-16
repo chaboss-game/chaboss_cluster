@@ -75,3 +75,22 @@ class MasterAdminService(cluster_pb2_grpc.MasterAdminServiceServicer):
             return cluster_pb2.LoadModelResponse(ok=False, error="Мастер не готов к загрузке модели")
         ok, err = self._master_node.load_model(request.hf_model_id.strip())
         return cluster_pb2.LoadModelResponse(ok=ok, error=err or "")
+
+    def UpdateWorkersConfig(
+        self,
+        request: cluster_pb2.UpdateWorkersConfigRequest,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.UpdateWorkersConfigResponse:
+        if self._master_node is None:
+            return cluster_pb2.UpdateWorkersConfigResponse(ok=False, error="Мастер не готов")
+        from cluster_core.common.config import WorkerConfig
+        workers = [
+            WorkerConfig(host=w.host or "", port=int(w.port) if w.port else 0, auth_token=w.auth_token or None)
+            for w in request.workers
+        ]
+        workers = [w for w in workers if w.host and w.port > 0]
+        try:
+            ok, err = self._master_node.update_workers_config(workers)
+            return cluster_pb2.UpdateWorkersConfigResponse(ok=ok, error=err or "")
+        except Exception as e:
+            return cluster_pb2.UpdateWorkersConfigResponse(ok=False, error=str(e))

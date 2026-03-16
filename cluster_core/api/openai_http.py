@@ -12,6 +12,8 @@ from typing import Any, List, Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from cluster_core.api.tokenizer_embedding import text_to_embeddings
+
 logger = logging.getLogger("master.openai_http")
 
 
@@ -101,32 +103,39 @@ def create_app(registry: Any, master_node: Any, config: Any = None) -> FastAPI:
             last = body.messages[-1]
             content = last.content if hasattr(last, "content") else str(last)
 
+        prompt_tokens = 0
+        completion_tokens = 0
         master_node = getattr(request.app.state, "master_node", None)
         if master_node and hasattr(master_node, "run_pipeline") and master_node.get_last_loaded_model_id():
             import asyncio
-            import torch
-            # Минимальный входной тензор из промпта (далее: токенизатор + эмбеддинги)
-            prompt_tensor = torch.tensor(
-                [[float(ord(c) % 256) / 255.0 for c in (content or " ")[:64]]],
-                dtype=torch.float32,
+
+            loaded_id = master_node.get_last_loaded_model_id()
+            # Токенизация и эмбеддинги через кэшированный токенизатор/эмбеддинг-слой
+            embeddings_tensor, prompt_tokens = text_to_embeddings(
+                loaded_id, content or " ", device="cpu"
             )
-            if prompt_tensor.shape[1] < 64:
-                pad = torch.zeros(1, 64 - prompt_tensor.shape[1], dtype=torch.float32)
-                prompt_tensor = torch.cat([prompt_tensor, pad], dim=1)
-            try:
-                loop = asyncio.get_running_loop()
-                out_tensor = await loop.run_in_executor(
-                    None,
-                    lambda: master_node.run_pipeline(prompt_tensor),
-                )
-                content = f"[Pipeline ok, output shape: {tuple(out_tensor.shape)}] " + (content or "")
-            except Exception as e:
-                logger.exception("run_pipeline failed")
-                content = f"[Pipeline error: {e}] " + (content or "")
+            if embeddings_tensor is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    out_tensor = await loop.run_in_executor(
+                        None,
+                        lambda: master_node.run_pipeline(embeddings_tensor),
+                    )
+                    # BERT не генерирует текст; возвращаем факт прохода по pipeline и форму выхода
+                    content = (
+                        f"[Энкодер: обработано токенов {prompt_tokens}, выход shape: {tuple(out_tensor.shape)}] "
+                        + (content or "")
+                    )
+                except Exception as e:
+                    logger.exception("run_pipeline failed")
+                    content = f"[Pipeline error: {e}] " + (content or "")
+            else:
+                content = "[Токенизатор/эмбеддинги недоступны для данной модели] " + (content or "")
 
         if not content:
             content = "(нет сообщений или модель не загружена)"
 
+        total_tokens = prompt_tokens + completion_tokens
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
@@ -139,7 +148,11 @@ def create_app(registry: Any, master_node: Any, config: Any = None) -> FastAPI:
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
         }
 
     @app.post("/v1/completions")
