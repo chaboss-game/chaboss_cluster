@@ -395,6 +395,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self._load_progress_dock)
         self._load_progress_dock.hide()
+        load_prog_widget.setMinimumWidth(280)
+        load_prog_widget.setMinimumHeight(120)
         self.statusBar().showMessage("Загрузка...")
 
         self._poller.workers_updated.connect(self._on_workers_updated)
@@ -812,11 +814,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Визуальный прогресс: поток LoadModelStream даёт живой % мастера и воркеров
         self._load_progress_dock.show()
+        self._load_progress_dock.raise_()
         self._load_stage_label.setText("Мастер: начало загрузки с HF...")
         self._load_progress_master.setValue(0)
         for bar in self._load_worker_bars.values():
             bar.setValue(0)
         self._model_edit.setEnabled(False)
+        QtWidgets.QApplication.processEvents()
+
+        def _ev_to_dict(ev) -> dict:
+            """Перевод события в dict для безопасной передачи в GUI-поток (без protobuf)."""
+            d = {
+                "master_percent": ev.master.percent if ev.master else 0,
+                "master_stage": (ev.master.stage or "download") if ev.master else "download",
+                "master_current_file": (ev.master.current_file or "") if ev.master else "",
+                "workers": {},
+                "done": bool(ev.done),
+                "ok": bool(ev.ok),
+                "error": (ev.error or "") or "",
+            }
+            for k, p in ev.workers.items():
+                d["workers"][k] = {"percent": p.percent if p else 0, "stage": (p.stage or "") if p else "", "current_file": (p.current_file or "") if p else ""}
+            return d
 
         def do_load():
             try:
@@ -827,18 +846,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         cluster_pb2.LoadModelRequest(hf_model_id=model_id),
                     )
                     for ev in stream:
-                        self.load_progress_event.emit(ev)
+                        self.load_progress_event.emit(_ev_to_dict(ev))
                         if ev.done:
                             self.load_finished.emit(ev.ok, ev.error or "")
                             break
                 except grpc.RpcError as rpc_err:
-                    # Мастер без LoadModelStream (старая версия) — fallback на LoadModel
                     if rpc_err.code() == grpc.StatusCode.UNIMPLEMENTED or "Method not found" in (rpc_err.details() or ""):
-                        self.load_progress_event.emit(
-                            cluster_pb2.LoadModelProgressEvent(
-                                master=cluster_pb2.LoadProgress(stage="download", percent=0),
-                            )
-                        )
+                        self.load_progress_event.emit({
+                            "master_percent": 0, "master_stage": "download", "master_current_file": "",
+                            "workers": {}, "done": False, "ok": False, "error": "",
+                        })
                         resp = stub.LoadModel(
                             cluster_pb2.LoadModelRequest(hf_model_id=model_id),
                             timeout=3600.0,
@@ -846,7 +863,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         ev = cluster_pb2.LoadModelProgressEvent(
                             done=True, ok=resp.ok, error=resp.error or ""
                         )
-                        self.load_progress_event.emit(ev)
+                        self.load_progress_event.emit(_ev_to_dict(ev))
                         self.load_finished.emit(ev.ok, ev.error or "")
                     else:
                         raise
@@ -854,6 +871,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self.load_finished.emit(False, str(e))
 
+        # Сразу показываем 0%, чтобы док не был пустым до первого ответа мастера
+        self.load_progress_event.emit({
+            "master_percent": 0, "master_stage": "download", "master_current_file": "",
+            "workers": {}, "done": False, "ok": False, "error": "",
+        })
         threading.Thread(target=do_load, daemon=True).start()
 
     def _show_load_error_dialog(self, error: str) -> None:
@@ -883,16 +905,18 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
         box.exec()
 
-    def _on_load_progress_event(self, ev) -> None:
-        """Обновить прогресс-бары из потока LoadModelStream."""
-        if ev.master and ev.master.percent >= 0:
-            self._load_progress_master.setValue(min(100, ev.master.percent))
-            stage = ev.master.stage or "download"
-            if ev.master.current_file:
-                self._load_stage_label.setText("Мастер: %s — %s (%d%%)" % (stage, ev.master.current_file, ev.master.percent))
-            else:
-                self._load_stage_label.setText("Мастер: %s (%d%%)" % (stage, ev.master.percent))
-        for key, prog in ev.workers.items():
+    def _on_load_progress_event(self, ev: dict) -> None:
+        """Обновить прогресс-бары из потока LoadModelStream (ev — dict из _ev_to_dict)."""
+        pct = ev.get("master_percent", 0)
+        if pct >= 0:
+            self._load_progress_master.setValue(min(100, pct))
+        stage = ev.get("master_stage") or "download"
+        cur_file = ev.get("master_current_file") or ""
+        if cur_file:
+            self._load_stage_label.setText("Мастер: %s — %s (%d%%)" % (stage, cur_file, pct))
+        else:
+            self._load_stage_label.setText("Мастер: %s (%d%%)" % (stage, pct))
+        for key, prog in (ev.get("workers") or {}).items():
             if key not in self._load_worker_bars:
                 bar = QtWidgets.QProgressBar()
                 bar.setMinimum(0)
@@ -901,9 +925,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 bar.setFormat("%s: %%p%%" % key)
                 self._load_worker_bars[key] = bar
                 self._load_workers_layout.addWidget(bar)
-            self._load_worker_bars[key].setValue(min(100, prog.percent))
-        if ev.done:
-            if ev.ok:
+            self._load_worker_bars[key].setValue(min(100, prog.get("percent", 0)))
+        if ev.get("done"):
+            if ev.get("ok"):
                 self._load_stage_label.setText("Модель успешно загружена: мастер и воркеры готовы")
             else:
                 self._load_stage_label.setText("Ошибка при загрузке модели — см. сообщение ниже")

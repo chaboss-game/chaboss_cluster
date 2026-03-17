@@ -27,8 +27,9 @@ HEARTBEAT_INTERVAL_S = 2.0
 RECONNECT_BACKOFF_INITIAL_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
 GET_STATUS_TIMEOUT_S = 15.0  # таймаут GetStatus при подключении/переподключении (медленная сеть или загрузка воркера)
-# InitShard: загрузка с HF и загрузка шарда на воркере может занимать десятки минут; жёсткий таймаут не задаём.
-INIT_SHARD_TIMEOUT_S = None  # без дедлайна (ожидание до завершения или обрыва)
+# InitShard: загрузка с HF и загрузка шарда на воркере может занимать десятки минут.
+# Явно задаём большой таймаут (7 дней); None в gRPC может подменяться дефолтом.
+INIT_SHARD_TIMEOUT_S = 86400 * 7
 
 # Keepalive для долгоживущих каналов к воркерам (снижает реконнекты из-за NAT/файрвола).
 WORKER_CHANNEL_OPTIONS = [
@@ -96,6 +97,9 @@ class MasterNode:
         self._desired_worker_configs: Dict[str, WorkerConfig] = {}  # key -> WorkerConfig, обновляется из UI
         self._stop_event = threading.Event()
         self._last_loaded_model_id: str | None = None
+        # Число подряд неудачных переподключений; RECONNECTING показываем только после N подряд.
+        self._reconnect_failures: Dict[str, int] = {}
+        self._reconnect_failures_before_status = 2
 
     def start_background(self) -> None:
         """Старт: первичное подключение к воркерам и поток HealthStream для каждого из конфига."""
@@ -233,8 +237,12 @@ class MasterNode:
             if stub is None:
                 if self._reconnect_worker(current_cfg):
                     backoff_s = RECONNECT_BACKOFF_INITIAL_S
+                    self._reconnect_failures[worker_key] = 0
                 else:
-                    self._registry.set_status(wid, WorkerStatus.RECONNECTING)
+                    n = self._reconnect_failures.get(worker_key, 0) + 1
+                    self._reconnect_failures[worker_key] = n
+                    if n >= self._reconnect_failures_before_status:
+                        self._registry.set_status(wid, WorkerStatus.RECONNECTING)
                     time.sleep(backoff_s)
                     backoff_s = min(backoff_s * 2, RECONNECT_BACKOFF_MAX_S)
                 continue

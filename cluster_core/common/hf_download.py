@@ -1,12 +1,13 @@
 """
 Скачивание репозитория HuggingFace с побайтовым прогрессом (httpx + chunked).
 Используется для отображения «живого» процента загрузки в GUI.
+На воркере всегда используем pathlib.Path через модуль pathlib, чтобы избежать NameError.
 """
 from __future__ import annotations
 
 import logging
+import pathlib
 import re
-from pathlib import Path
 from typing import Callable
 
 logger = logging.getLogger("cluster.hf_download")
@@ -27,17 +28,16 @@ def _match_patterns(filename: str) -> bool:
 def download_repo_with_progress(
     repo_id: str,
     revision: str = "main",
-    cache_dir: str | Path | None = None,
+    cache_dir: str | pathlib.Path | None = None,
     token: str | bool | None = None,
     progress_callback: Callable[[float, int, int, str], None] | None = None,
-) -> Path:
+) -> pathlib.Path:
     """
     Скачивает файлы репозитория (*.bin, *.safetensors, *.msgpack) в локальную папку
     с вызовом progress_callback(percent, bytes_done, bytes_total, current_file).
 
     Возвращает путь к скачанной директории (в ней лежат файлы в корне).
     """
-    from pathlib import Path  # гарантия наличия на воркере при ленивом импорте
     try:
         from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
     except ImportError:
@@ -69,7 +69,7 @@ def download_repo_with_progress(
         total_size = 1  # избежать деления на 0
 
     # Директория кэша: cache_dir/chaboss/<repo_sanitized>/<revision>/
-    cache_base = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "huggingface" / "hub"
+    cache_base = pathlib.Path(cache_dir) if cache_dir else pathlib.Path.home() / ".cache" / "huggingface" / "hub"
     repo_safe = re.sub(r"[^\w\-.]", "--", repo_id)
     out_dir = cache_base / "chaboss_downloads" / repo_safe / revision
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +81,7 @@ def download_repo_with_progress(
 
     with httpx.Client(follow_redirects=True, timeout=60.0, headers=headers or None) as client:
         for filename, download_url, size in file_infos:
-            out_path = out_dir / Path(filename).name
+            out_path = out_dir / pathlib.Path(filename).name
             if out_path.exists() and out_path.stat().st_size == size:
                 bytes_done += size
                 if progress_callback:
@@ -111,14 +111,13 @@ def _fmt_size(n: int) -> str:
     return f"{n} B"
 
 
-def load_state_dict_from_dir(path: Path, model_id: str = ""):
+def load_state_dict_from_dir(path: pathlib.Path | str, model_id: str = ""):
     """
     Загружает state_dict из директории (pytorch_model.bin / model.safetensors / *.safetensors).
     Возвращает dict. model_id используется только для fallback через transformers.
     """
-    from pathlib import Path
     import torch
-    path = path if isinstance(path, Path) else Path(path)
+    path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
     state_dict = None
     if (path / "pytorch_model.bin").exists():
         state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
