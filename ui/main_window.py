@@ -9,6 +9,7 @@ import os
 import sys
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
@@ -29,6 +30,11 @@ from .settings_store import load as load_settings, save as save_settings
 DEFAULT_MASTER_ADDR = "127.0.0.1:60051"
 POLL_INTERVAL_MS = 3000
 AUTOSAVE_DELAY_MS = 500
+
+MODEL_LOAD_MODES = [
+    ("fit_in_cluster", "Модель влезает в кластер"),
+    ("streaming_chunks", "Модель по частям (стриминг)"),
+]
 
 _STATUS_NAMES = {
     0: "ONLINE",
@@ -78,6 +84,7 @@ class MainWindow(QtWidgets.QMainWindow):
     load_finished = QtCore.pyqtSignal(bool, str)
     unload_finished = QtCore.pyqtSignal(bool, str)
     apply_workers_finished = QtCore.pyqtSignal(bool, str)
+    log_message = QtCore.pyqtSignal(str)  # сообщение для вкладки «Лог» (с меткой времени добавляется в слоте)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
@@ -85,6 +92,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_finished.connect(self._on_load_finished)
         self.unload_finished.connect(self._on_unload_finished)
         self.apply_workers_finished.connect(self._on_apply_workers_finished)
+        self.log_message.connect(self._append_log_line)
 
         settings = load_settings()
         self._addr = (
@@ -104,10 +112,38 @@ class MainWindow(QtWidgets.QMainWindow):
         table.setModel(self._table_model)
         table.horizontalHeader().setStretchLastSection(True)
 
-        workers_layout = QtWidgets.QVBoxLayout()
         self._addr_label = QtWidgets.QLabel(f"Мастер: {self._addr} (обновление каждые {POLL_INTERVAL_MS // 1000} с)")
-        workers_layout.addWidget(self._addr_label)
-        workers_layout.addWidget(table)
+
+        table_container = QtWidgets.QWidget()
+        table_layout = QtWidgets.QVBoxLayout()
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(self._addr_label)
+        table_layout.addWidget(table)
+        table_container.setLayout(table_layout)
+
+        log_container = QtWidgets.QWidget()
+        log_layout = QtWidgets.QVBoxLayout()
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(QtWidgets.QLabel("Лог"))
+        self._log_text = QtWidgets.QPlainTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setPlaceholderText(
+            "Здесь отображаются процессы выгрузки/загрузки модели, статусы воркеров и прочие события."
+        )
+        log_layout.addWidget(self._log_text)
+        clear_log_btn = QtWidgets.QPushButton("Очистить лог")
+        clear_log_btn.clicked.connect(self._log_text.clear)
+        log_layout.addWidget(clear_log_btn)
+        log_container.setLayout(log_layout)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter.addWidget(table_container)
+        splitter.addWidget(log_container)
+        splitter.setStretchFactor(0, 7)  # ~70%
+        splitter.setStretchFactor(1, 3)  # ~30%
+
+        workers_layout = QtWidgets.QVBoxLayout()
+        workers_layout.addWidget(splitter)
         workers_page = QtWidgets.QWidget()
         workers_page.setLayout(workers_layout)
 
@@ -129,6 +165,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._master_process: subprocess.Popen | None = None
         master_grp.setLayout(master_layout)
         settings_layout.addWidget(master_grp)
+
+        # Режим загрузки модели и использование ресурсов
+        mode_grp = QtWidgets.QGroupBox("Режим загрузки модели")
+        mode_layout = QtWidgets.QVBoxLayout()
+        self._mode_combo = QtWidgets.QComboBox()
+        for value, label in MODEL_LOAD_MODES:
+            self._mode_combo.addItem(label, value)
+        self._mode_combo.currentIndexChanged.connect(self._schedule_save)
+        mode_layout.addWidget(QtWidgets.QLabel("Режим:"))
+        mode_layout.addWidget(self._mode_combo)
+        resource_layout = QtWidgets.QHBoxLayout()
+        resource_layout.addWidget(QtWidgets.QLabel("Использование свободных ресурсов (%):"))
+        self._resource_percent_spin = QtWidgets.QSpinBox()
+        self._resource_percent_spin.setRange(1, 100)
+        self._resource_percent_spin.setValue(75)
+        self._resource_percent_spin.setSuffix(" %")
+        self._resource_percent_spin.valueChanged.connect(self._schedule_save)
+        resource_layout.addWidget(self._resource_percent_spin)
+        resource_layout.addStretch()
+        mode_layout.addLayout(resource_layout)
+        mode_grp.setLayout(mode_layout)
+        settings_layout.addWidget(mode_grp)
 
         # Конфиг воркеров (IP, port, key)
         workers_grp = QtWidgets.QGroupBox("Конфиг воркеров")
@@ -192,12 +250,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._timer.start(POLL_INTERVAL_MS)
         self._on_timer()
 
-        # Применить загруженные настройки (модель, таблица воркеров)
+        # Применить загруженные настройки (модель, таблица воркеров, режим, ресурсы)
         self._model_edit.setText(settings.get("hf_model_id", "") or "")
         self._load_workers_into_table(settings.get("workers", []))
+        mode_val = settings.get("model_load_mode", "fit_in_cluster")
+        idx = self._mode_combo.findData(mode_val)
+        if idx >= 0:
+            self._mode_combo.setCurrentIndex(idx)
+        self._resource_percent_spin.setValue(max(1, min(100, int(settings.get("resource_usage_percent", 75)))))
 
         # Обновлять адрес поллера при переключении на вкладку Воркеры или по таймеру
         self._apply_master_addr_from_edit()
+
+        self.append_log("Запуск приложения. Подключение к мастеру: " + self._addr)
 
     def _load_workers_into_table(self, workers: List[dict]) -> None:
         self._workers_table.blockSignals(True)
@@ -245,9 +310,22 @@ class MainWindow(QtWidgets.QMainWindow):
         data = {
             "master_addr": addr,
             "hf_model_id": self._model_edit.text().strip(),
+            "model_load_mode": self._mode_combo.currentData() or "fit_in_cluster",
+            "resource_usage_percent": self._resource_percent_spin.value(),
             "workers": self._get_workers_from_table(),
         }
         save_settings(data)
+
+    def append_log(self, message: str) -> None:
+        """Добавить строку в окно логов (с меткой времени). Безопасно вызывать из любого потока."""
+        if QtCore.QThread.currentThread() is self.thread():
+            self._append_log_line(message)
+        else:
+            self.log_message.emit(message)
+
+    def _append_log_line(self, message: str) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._log_text.appendPlainText(f"[{ts}] {message}")
 
     def _apply_master_addr_from_edit(self) -> None:
         addr = self._master_edit.text().strip() or DEFAULT_MASTER_ADDR
@@ -259,8 +337,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_start_master(self) -> None:
         """Запуск мастера в отдельном процессе (python -m scripts.run_master)."""
         if self._master_process is not None and self._master_process.poll() is None:
+            self.append_log("Мастер уже запущен (PID %s)" % self._master_process.pid)
             self.statusBar().showMessage(f"Мастер уже запущен (PID {self._master_process.pid})")
             return
+        self.append_log("Запуск мастера (python -m scripts.run_master)...")
         project_root = Path(__file__).resolve().parent.parent
         try:
             self._master_process = subprocess.Popen(
@@ -270,8 +350,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            self.append_log("Мастер запущен, PID %s" % self._master_process.pid)
             self.statusBar().showMessage(f"Мастер запущен (PID {self._master_process.pid})")
         except Exception as e:
+            self.append_log("Ошибка запуска мастера: %s" % e)
             self.statusBar().showMessage(f"Ошибка запуска мастера: {e}")
             self._master_process = None
 
@@ -282,6 +364,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Отправить конфиг воркеров на мастер (UpdateWorkersConfig)."""
         self._apply_master_addr_from_edit()
         self._save_settings()
+        self.append_log("Применение конфига воркеров на мастере...")
         self.statusBar().showMessage("Применение конфига воркеров...")
 
         def do_apply():
@@ -309,13 +392,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_apply_workers_finished(self, ok: bool, error: str) -> None:
         if ok:
+            self.append_log("Конфиг воркеров успешно применён на мастере")
             self.statusBar().showMessage("Конфиг воркеров применён на мастере")
         else:
+            self.append_log("Ошибка применения конфига воркеров: " + error)
             self.statusBar().showMessage(f"Ошибка применения конфига: {error}")
 
     def _on_scan(self) -> None:
         self._apply_master_addr_from_edit()
         self._save_settings()
+        self.append_log("Скан воркеров на мастере %s..." % self._addr)
         threading.Thread(target=self._poller.poll, daemon=True).start()
         self.statusBar().showMessage("Скан...")
 
@@ -326,6 +412,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not model_id:
             self.statusBar().showMessage("Введите название модели HuggingFace")
             return
+        self.append_log("Загрузка модели %s (режим: %s, ресурсы: %s%%)..." % (
+            model_id,
+            self._mode_combo.currentData() or "fit_in_cluster",
+            self._resource_percent_spin.value(),
+        ))
         self.statusBar().showMessage(f"Загрузка модели {model_id}...")
         self._model_edit.setEnabled(False)
 
@@ -347,11 +438,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_load_finished(self, ok: bool, error: str) -> None:
         self._model_edit.setEnabled(True)
         if ok:
+            self.append_log("Модель загружена и разослана воркерам")
             self.statusBar().showMessage("Модель загружена и разослана воркерам")
         else:
+            self.append_log("Ошибка загрузки модели: " + error)
             self.statusBar().showMessage(f"Ошибка: {error}")
 
     def _on_unload_model(self) -> None:
+        self.append_log("Выгрузка модели с воркеров...")
         self.statusBar().showMessage("Выгрузка модели с воркеров...")
 
         def do_unload() -> None:
@@ -371,15 +465,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_unload_finished(self, ok: bool, error: str) -> None:
         if ok:
+            self.append_log("Модель выгружена с воркеров (VRAM освобождена)")
             self.statusBar().showMessage("Модель выгружена с воркеров (VRAM освобождена)")
         else:
+            self.append_log("Ошибка выгрузки модели: " + error)
             self.statusBar().showMessage(f"Ошибка выгрузки: {error}")
 
     def _on_workers_updated(self, workers: Dict[str, dict]) -> None:
         self._table_model.update_workers(workers)
-        self.statusBar().showMessage(f"Воркеров: {len(workers)}")
+        n = len(workers)
+        self.statusBar().showMessage(f"Воркеров: {n}")
+        # В лог только при изменении числа воркеров (избегаем спама при каждом опросе)
+        if getattr(self, "_last_workers_count", None) != n:
+            self._last_workers_count = n
+            self.append_log("Воркеров в реестре: %s" % n)
 
     def _on_poller_error(self, msg: str) -> None:
+        self.append_log("Ошибка подключения к мастеру: " + msg)
         self.statusBar().showMessage(f"Ошибка: {msg}")
         self._table_model.update_workers({})
 

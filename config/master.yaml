@@ -8,9 +8,17 @@ http_listen_port: 8055
 
 parallel_backend: "baseline"  # baseline | accelerate | deepspeed
 
+# Режим загрузки модели: fit_in_cluster (модель влезает) | streaming_chunks (по частям)
+model_load_mode: "fit_in_cluster"
+# Использование свободных ресурсов (VRAM/RAM) в процентах под модель (1-100)
+resource_usage_percent: 75
+
 # Initial static list of workers.
 workers:
-  - host: "127.0.0.1"
-    port: 60052
-    auth_token: null
+  - host: "192.168.0.109"
+    port: 55555
+    auth_token: "win10_test"
+  - host: "192.168.0.110"
+    port: 44444
+    auth_token: "kubuntu25_test"
 

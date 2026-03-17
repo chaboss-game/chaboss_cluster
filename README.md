@@ -23,6 +23,7 @@
 - `scripts/run_worker.py` — запуск воркера.
 - `ui/main_window.py` — PyQt6 UI для мониторинга кластера.
 - `config/` — базовые YAML‑конфиги мастера и воркера.
+- `docs/DESIGN_MODES.md` — описание режимов загрузки модели (модель влезает в кластер / по частям).
 - `requirements.txt` — зависимости Python.
 
 ---
@@ -268,7 +269,7 @@ UI каждые 3 с опрашивает мастер (ListWorkers) и пока
 - Мастер: реестр воркеров, HealthStream + автопереподключение с backoff, загрузка модели с HF и рассылка шардов (LoadModel); разбиение по слоям: BERT (encoder.layer), GPT‑2 (transformer.h), LLaMA/Qwen2 (model.layers), иначе round‑robin; run_pipeline с передачей model_id/shard_id.
 - Admin API: ListWorkers, LoadModel, UnloadModel; при LoadModel текущая модель сначала выгружается с воркеров.
 - OpenAI‑совместимый HTTP API на порту 8055: /v1/models, /v1/chat/completions, /v1/completions; при загруженной модели chat/completions: токенизатор (кэш по model_id) → эмбеддинги (BERT) → run_pipeline → ответ с учётом выхода энкодера; в usage возвращаются prompt_tokens.
-- PyQt6 UI: вкладки Воркеры/Настройки, конфиг воркеров (IP, port, key), модель HF, Скан/Старт, **Выгрузить модель** (UnloadModel), автосохранение настроек; кнопка «Применить конфиг на мастере» (UpdateWorkersConfig).
+- PyQt6 UI: вкладки Воркеры, Настройки, **Лог**; конфиг воркеров (IP, port, key), модель HF, Скан/Старт, Выгрузить модель (UnloadModel), кнопка «Старт мастера», **режим загрузки модели** (влезает в кластер / по частям), **использование ресурсов %** (1–100); автосохранение настроек; окно логов с метками времени для основных операций.
 
 **Осталось по плану:**
 

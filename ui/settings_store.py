@@ -20,6 +20,8 @@ def _config_path() -> Path:
 DEFAULT = {
     "master_addr": "127.0.0.1:60051",
     "hf_model_id": "",
+    "model_load_mode": "fit_in_cluster",  # fit_in_cluster | streaming_chunks
+    "resource_usage_percent": 75,
     "workers": [
         {"host": "127.0.0.1", "port": 60052, "auth_token": ""},
     ],
@@ -38,6 +40,8 @@ def load() -> dict[str, Any]:
     # merge with defaults so new keys appear
     out = dict(DEFAULT)
     out.update(data)
+    if "resource_usage_percent" in data and isinstance(data["resource_usage_percent"], (int, float)):
+        out["resource_usage_percent"] = max(1, min(100, int(data["resource_usage_percent"])))
     if "workers" in data and isinstance(data["workers"], list):
         out["workers"] = [
             {"host": str(w.get("host", "")), "port": int(w.get("port", 0)), "auth_token": str(w.get("auth_token", ""))}
