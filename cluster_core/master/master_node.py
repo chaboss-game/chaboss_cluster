@@ -27,7 +27,8 @@ HEARTBEAT_INTERVAL_S = 2.0
 RECONNECT_BACKOFF_INITIAL_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
 GET_STATUS_TIMEOUT_S = 15.0  # таймаут GetStatus при подключении/переподключении (медленная сеть или загрузка воркера)
-INIT_SHARD_TIMEOUT_S = 900.0  # таймаут InitShard на воркере: скачивание с HF + загрузка шарда для больших моделей (до 15 мин)
+# InitShard: загрузка с HF и загрузка шарда на воркере может занимать десятки минут; жёсткий таймаут не задаём.
+INIT_SHARD_TIMEOUT_S = None  # без дедлайна (ожидание до завершения или обрыва)
 
 # Keepalive для долгоживущих каналов к воркерам (снижает реконнекты из-за NAT/файрвола).
 WORKER_CHANNEL_OPTIONS = [
@@ -460,6 +461,9 @@ class MasterNode:
             if bad:
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))))
                 return
+
+            # Сразу эмитим начальное событие, чтобы в GUI отобразился прогресс-бар.
+            progress_queue.put(make_event(make_master_progress("download", 0), {}))
 
             def on_master_progress(percent: float, bytes_done: int, bytes_total: int, current_file: str) -> None:
                 progress_queue.put(make_event(

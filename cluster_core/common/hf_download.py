@@ -37,6 +37,7 @@ def download_repo_with_progress(
 
     Возвращает путь к скачанной директории (в ней лежат файлы в корне).
     """
+    from pathlib import Path  # гарантия наличия на воркере при ленивом импорте
     try:
         from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
     except ImportError:
@@ -115,7 +116,9 @@ def load_state_dict_from_dir(path: Path, model_id: str = ""):
     Загружает state_dict из директории (pytorch_model.bin / model.safetensors / *.safetensors).
     Возвращает dict. model_id используется только для fallback через transformers.
     """
+    from pathlib import Path
     import torch
+    path = path if isinstance(path, Path) else Path(path)
     state_dict = None
     if (path / "pytorch_model.bin").exists():
         state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
