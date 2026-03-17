@@ -9,6 +9,7 @@ import os
 import sys
 import subprocess
 import threading
+import yaml
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -101,6 +102,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or settings.get("master_addr", DEFAULT_MASTER_ADDR)
         ).strip()
         self._poller = MasterPoller(self._addr, self)
+        self._last_workers_dict: Dict[str, dict] = {}
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._on_timer)
         self._save_timer = QtCore.QTimer(self)
@@ -136,14 +138,30 @@ class MainWindow(QtWidgets.QMainWindow):
         log_layout.addWidget(clear_log_btn)
         log_container.setLayout(log_layout)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        splitter.addWidget(table_container)
-        splitter.addWidget(log_container)
-        splitter.setStretchFactor(0, 7)  # ~70%
-        splitter.setStretchFactor(1, 3)  # ~30%
+        # Панель «Режим воркера»: показывается при запущенном воркере вместо таблицы кластера
+        self._worker_panel = QtWidgets.QWidget()
+        worker_panel_layout = QtWidgets.QVBoxLayout()
+        self._worker_status_label = QtWidgets.QLabel("Режим: Воркер\nПорт: —\nСтатус: не запущен")
+        self._worker_status_label.setStyleSheet("font-size: 13px; padding: 12px;")
+        worker_panel_layout.addWidget(self._worker_status_label)
+        worker_panel_layout.addWidget(
+            QtWidgets.QLabel("Мастер подключается к воркерам по своему конфигу. Этот узел ожидает запросы от мастера.")
+        )
+        worker_panel_layout.addStretch()
+        self._worker_panel.setLayout(worker_panel_layout)
+
+        self._cluster_stack = QtWidgets.QStackedWidget()
+        self._cluster_stack.addWidget(table_container)   # индекс 0: вид «мастер» (таблица воркеров)
+        self._cluster_stack.addWidget(self._worker_panel)  # индекс 1: вид «воркер»
+
+        splitter_main = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter_main.addWidget(self._cluster_stack)
+        splitter_main.addWidget(log_container)
+        splitter_main.setStretchFactor(0, 7)
+        splitter_main.setStretchFactor(1, 3)
 
         workers_layout = QtWidgets.QVBoxLayout()
-        workers_layout.addWidget(splitter)
+        workers_layout.addWidget(splitter_main)
         workers_page = QtWidgets.QWidget()
         workers_page.setLayout(workers_layout)
 
@@ -158,11 +176,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._master_edit.setText(self._addr)
         self._master_edit.textChanged.connect(self._schedule_save)
         master_layout.addWidget(self._master_edit)
+        master_btn_layout = QtWidgets.QHBoxLayout()
         start_master_btn = QtWidgets.QPushButton("Старт мастера")
         start_master_btn.setToolTip("Запуск мастера в отдельном процессе (python -m scripts.run_master)")
         start_master_btn.clicked.connect(self._on_start_master)
-        master_layout.addWidget(start_master_btn)
+        stop_master_btn = QtWidgets.QPushButton("Остановить мастера")
+        stop_master_btn.clicked.connect(self._on_stop_master)
+        restart_master_btn = QtWidgets.QPushButton("Перезапустить мастера")
+        restart_master_btn.clicked.connect(self._on_restart_master)
+        master_btn_layout.addWidget(start_master_btn)
+        master_btn_layout.addWidget(stop_master_btn)
+        master_btn_layout.addWidget(restart_master_btn)
+        master_layout.addLayout(master_btn_layout)
         self._master_process: subprocess.Popen | None = None
+        self._start_master_btn = start_master_btn
+        self._stop_master_btn = stop_master_btn
+        self._restart_master_btn = restart_master_btn
+        self._master_grp = master_grp
         master_grp.setLayout(master_layout)
         settings_layout.addWidget(master_grp)
 
@@ -182,9 +212,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._resource_percent_spin.setValue(75)
         self._resource_percent_spin.setSuffix(" %")
         self._resource_percent_spin.valueChanged.connect(self._schedule_save)
+        self._resource_percent_spin.valueChanged.connect(
+            lambda: self._update_resources_label(getattr(self, "_last_workers_dict", {}))
+        )
         resource_layout.addWidget(self._resource_percent_spin)
         resource_layout.addStretch()
         mode_layout.addLayout(resource_layout)
+        self._resources_label = QtWidgets.QLabel("Свободные ресурсы: — (выполните Скан на вкладке Воркеры)")
+        self._resources_label.setWordWrap(True)
+        mode_layout.addWidget(self._resources_label)
+        self._mode_grp = mode_grp
         mode_grp.setLayout(mode_layout)
         settings_layout.addWidget(mode_grp)
 
@@ -208,6 +245,7 @@ class MainWindow(QtWidgets.QMainWindow):
         w_btn_layout.addStretch()
         w_layout.addWidget(self._workers_table)
         w_layout.addLayout(w_btn_layout)
+        self._workers_grp = workers_grp
         workers_grp.setLayout(w_layout)
         settings_layout.addWidget(workers_grp)
 
@@ -231,6 +269,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout.addWidget(unload_btn)
         btn_layout.addStretch()
         model_layout.addLayout(btn_layout)
+        self._model_grp = model_grp
         model_grp.setLayout(model_layout)
         settings_layout.addWidget(model_grp)
 
@@ -238,9 +277,39 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_page = QtWidgets.QWidget()
         settings_page.setLayout(settings_layout)
 
+        # ——— Вкладка «Воркер» ———
+        worker_tab = QtWidgets.QWidget()
+        worker_tab_layout = QtWidgets.QVBoxLayout()
+        worker_cfg_grp = QtWidgets.QGroupBox("Запуск воркера")
+        worker_cfg_layout = QtWidgets.QVBoxLayout()
+        worker_cfg_layout.addWidget(QtWidgets.QLabel("Конфиг воркера (путь относительно корня проекта):"))
+        self._worker_config_edit = QtWidgets.QLineEdit()
+        self._worker_config_edit.setPlaceholderText("config/worker.yaml")
+        self._worker_config_edit.textChanged.connect(self._schedule_save)
+        worker_cfg_layout.addWidget(self._worker_config_edit)
+        worker_btn_layout = QtWidgets.QHBoxLayout()
+        self._start_worker_btn = QtWidgets.QPushButton("Старт воркера")
+        self._start_worker_btn.clicked.connect(self._on_start_worker)
+        self._stop_worker_btn = QtWidgets.QPushButton("Остановить воркера")
+        self._stop_worker_btn.clicked.connect(self._on_stop_worker)
+        self._restart_worker_btn = QtWidgets.QPushButton("Перезапустить воркера")
+        self._restart_worker_btn.clicked.connect(self._on_restart_worker)
+        worker_btn_layout.addWidget(self._start_worker_btn)
+        worker_btn_layout.addWidget(self._stop_worker_btn)
+        worker_btn_layout.addWidget(self._restart_worker_btn)
+        worker_btn_layout.addStretch()
+        worker_cfg_layout.addLayout(worker_btn_layout)
+        worker_cfg_grp.setLayout(worker_cfg_layout)
+        worker_tab_layout.addWidget(worker_cfg_grp)
+        worker_tab_layout.addStretch()
+        worker_tab.setLayout(worker_tab_layout)
+        self._worker_process: subprocess.Popen | None = None
+        self._worker_display_port: int | None = None
+
         tabs = QtWidgets.QTabWidget()
-        tabs.addTab(workers_page, "Воркеры")
+        tabs.addTab(workers_page, "Кластер")
         tabs.addTab(settings_page, "Настройки")
+        tabs.addTab(worker_tab, "Воркер")
 
         self.setCentralWidget(tabs)
         self.statusBar().showMessage("Загрузка...")
@@ -258,10 +327,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if idx >= 0:
             self._mode_combo.setCurrentIndex(idx)
         self._resource_percent_spin.setValue(max(1, min(100, int(settings.get("resource_usage_percent", 75)))))
+        self._worker_config_edit.setText(settings.get("worker_config_path", "config/worker.yaml") or "config/worker.yaml")
 
         # Обновлять адрес поллера при переключении на вкладку Воркеры или по таймеру
         self._apply_master_addr_from_edit()
 
+        self._update_process_state()
         self.append_log("Запуск приложения. Подключение к мастеру: " + self._addr)
 
     def _load_workers_into_table(self, workers: List[dict]) -> None:
@@ -313,6 +384,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "model_load_mode": self._mode_combo.currentData() or "fit_in_cluster",
             "resource_usage_percent": self._resource_percent_spin.value(),
             "workers": self._get_workers_from_table(),
+            "worker_config_path": self._worker_config_edit.text().strip() or "config/worker.yaml",
         }
         save_settings(data)
 
@@ -352,10 +424,157 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.append_log("Мастер запущен, PID %s" % self._master_process.pid)
             self.statusBar().showMessage(f"Мастер запущен (PID {self._master_process.pid})")
+            self._update_process_state()
         except Exception as e:
             self.append_log("Ошибка запуска мастера: %s" % e)
             self.statusBar().showMessage(f"Ошибка запуска мастера: {e}")
             self._master_process = None
+
+    def _on_stop_master(self) -> None:
+        """Остановка процесса мастера."""
+        if self._master_process is None:
+            self.append_log("Мастер не запущен")
+            self.statusBar().showMessage("Мастер не запущен")
+            return
+        if self._master_process.poll() is not None:
+            self.append_log("Мастер уже остановлен")
+            self._master_process = None
+            return
+        try:
+            self._master_process.terminate()
+            self._master_process.wait(timeout=5)
+        except Exception:
+            try:
+                self._master_process.kill()
+            except Exception:
+                pass
+        self.append_log("Мастер остановлен (PID %s)" % getattr(self._master_process, "pid", ""))
+        self._master_process = None
+        self.statusBar().showMessage("Мастер остановлен")
+        self._update_process_state()
+
+    def _on_restart_master(self) -> None:
+        """Перезапуск мастера: остановка, затем старт."""
+        self._on_stop_master()
+        if self._master_process is None:
+            QtCore.QTimer.singleShot(500, self._on_start_master)
+
+    def _update_process_state(self) -> None:
+        """Обновить вид кластера и блокировки: мастер и воркер взаимоисключающие."""
+        master_running = self._master_process is not None and self._master_process.poll() is None
+        worker_running = self._worker_process is not None and self._worker_process.poll() is None
+
+        if worker_running:
+            self._cluster_stack.setCurrentIndex(1)
+            self._worker_status_label.setText(
+                "Режим: Воркер\nПорт: %s\nСтатус: работает (PID %s)"
+                % (self._worker_display_port or "—", getattr(self._worker_process, "pid", ""))
+            )
+            self._timer.stop()
+            self._start_master_btn.setEnabled(False)
+            self._stop_master_btn.setEnabled(False)
+            self._restart_master_btn.setEnabled(False)
+            self._master_grp.setEnabled(False)
+            self._mode_grp.setEnabled(False)
+            self._workers_grp.setEnabled(False)
+            self._model_grp.setEnabled(False)
+            self._start_worker_btn.setEnabled(False)
+            self._stop_worker_btn.setEnabled(True)
+            self._restart_worker_btn.setEnabled(True)
+        elif master_running:
+            self._cluster_stack.setCurrentIndex(0)
+            self._timer.start(POLL_INTERVAL_MS)
+            self._start_master_btn.setEnabled(True)
+            self._stop_master_btn.setEnabled(True)
+            self._restart_master_btn.setEnabled(True)
+            self._master_grp.setEnabled(True)
+            self._mode_grp.setEnabled(True)
+            self._workers_grp.setEnabled(True)
+            self._model_grp.setEnabled(True)
+            self._start_worker_btn.setEnabled(False)
+            self._stop_worker_btn.setEnabled(False)
+            self._restart_worker_btn.setEnabled(False)
+        else:
+            self._cluster_stack.setCurrentIndex(0)
+            self._worker_status_label.setText("Режим: Воркер\nПорт: —\nСтатус: не запущен")
+            self._timer.start(POLL_INTERVAL_MS)
+            self._start_master_btn.setEnabled(True)
+            self._stop_master_btn.setEnabled(True)
+            self._restart_master_btn.setEnabled(True)
+            self._master_grp.setEnabled(True)
+            self._mode_grp.setEnabled(True)
+            self._workers_grp.setEnabled(True)
+            self._model_grp.setEnabled(True)
+            self._start_worker_btn.setEnabled(True)
+            self._stop_worker_btn.setEnabled(False)
+            self._restart_worker_btn.setEnabled(False)
+
+    def _on_start_worker(self) -> None:
+        """Запуск воркера в отдельном процессе."""
+        if self._worker_process is not None and self._worker_process.poll() is None:
+            self.append_log("Воркер уже запущен (PID %s)" % self._worker_process.pid)
+            self.statusBar().showMessage("Воркер уже запущен")
+            return
+        if self._master_process is not None and self._master_process.poll() is None:
+            self.append_log("Невозможно запустить воркер: мастер уже запущен в этом окне")
+            self.statusBar().showMessage("Сначала остановите мастера")
+            return
+        self._save_settings()
+        project_root = Path(__file__).resolve().parent.parent
+        config_path = self._worker_config_edit.text().strip() or "config/worker.yaml"
+        path_resolved = (project_root / config_path).resolve()
+        self._worker_display_port = None
+        try:
+            if path_resolved.exists():
+                with open(path_resolved, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                self._worker_display_port = int(cfg.get("listen_port", 0)) or None
+        except Exception:
+            pass
+        self.append_log("Запуск воркера (python -m scripts.run_worker --config %s)..." % config_path)
+        try:
+            self._worker_process = subprocess.Popen(
+                [sys.executable, "-m", "scripts.run_worker", "--config", str(path_resolved)],
+                cwd=project_root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.append_log("Воркер запущен, PID %s" % self._worker_process.pid)
+            self.statusBar().showMessage("Воркер запущен (PID %s)" % self._worker_process.pid)
+        except Exception as e:
+            self.append_log("Ошибка запуска воркера: %s" % e)
+            self.statusBar().showMessage("Ошибка запуска воркера: %s" % e)
+            self._worker_process = None
+        self._update_process_state()
+
+    def _on_stop_worker(self) -> None:
+        """Остановка процесса воркера."""
+        if self._worker_process is None:
+            self.append_log("Воркер не запущен")
+            return
+        if self._worker_process.poll() is not None:
+            self._worker_process = None
+            self._update_process_state()
+            return
+        try:
+            self._worker_process.terminate()
+            self._worker_process.wait(timeout=5)
+        except Exception:
+            try:
+                self._worker_process.kill()
+            except Exception:
+                pass
+        self.append_log("Воркер остановлен (PID %s)" % getattr(self._worker_process, "pid", ""))
+        self._worker_process = None
+        self.statusBar().showMessage("Воркер остановлен")
+        self._update_process_state()
+
+    def _on_restart_worker(self) -> None:
+        """Перезапуск воркера."""
+        self._on_stop_worker()
+        if self._worker_process is None:
+            QtCore.QTimer.singleShot(500, self._on_start_worker)
 
     def _on_timer(self) -> None:
         threading.Thread(target=self._poller.poll, daemon=True).start()
@@ -435,6 +654,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         threading.Thread(target=do_load, daemon=True).start()
 
+    def _show_load_error_dialog(self, error: str) -> None:
+        """Диалог при ошибке загрузки модели с подсказками по ресурсам и режиму."""
+        msg = (
+            "Ошибка загрузки модели:\n\n%s\n\n"
+            "Рекомендации:\n"
+            "• Если модель не влезает в выбранный %% свободных ресурсов — увеличьте "
+            "«Использование свободных ресурсов (%%)» в настройках (например, до 80–90%%).\n"
+            "• Если модель не влезает даже при 100%%:\n"
+            "  (a) Переключитесь в режим «Модель по частям (стриминг)»;\n"
+            "  (b) Добавьте воркеров в кластер для увеличения суммарных ресурсов."
+        ) % error
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Ошибка загрузки модели")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setText(msg)
+        box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+        box.exec()
+
     def _on_load_finished(self, ok: bool, error: str) -> None:
         self._model_edit.setEnabled(True)
         if ok:
@@ -443,6 +680,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.append_log("Ошибка загрузки модели: " + error)
             self.statusBar().showMessage(f"Ошибка: {error}")
+            self._show_load_error_dialog(error)
 
     def _on_unload_model(self) -> None:
         self.append_log("Выгрузка модели с воркеров...")
@@ -471,19 +709,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.append_log("Ошибка выгрузки модели: " + error)
             self.statusBar().showMessage(f"Ошибка выгрузки: {error}")
 
+    def _update_resources_label(self, workers: Dict[str, dict]) -> None:
+        """Обновить подпись свободных ресурсов и примерного размера модели при выбранном %."""
+        total_ram_mb = sum(w.get("ram_available_mb") or 0 for w in workers.values())
+        total_vram_mb = 0
+        for w in workers.values():
+            for g in w.get("gpus", []):
+                total_vram_mb += g.get("total_vram_mb") or 0
+        pct = self._resource_percent_spin.value()
+        budget_mb = int((total_ram_mb + total_vram_mb) * pct / 100.0)
+        budget_gb = budget_mb / 1024.0
+        if total_ram_mb + total_vram_mb > 0:
+            self._resources_label.setText(
+                "Свободно в кластере: RAM %d MB, VRAM %d MB. "
+                "При выбранном %s%% под модель влезает примерно до %.2f GB."
+                % (total_ram_mb, total_vram_mb, pct, budget_gb)
+            )
+        else:
+            self._resources_label.setText("Свободные ресурсы: нет данных (выполните Скан)")
+
     def _on_workers_updated(self, workers: Dict[str, dict]) -> None:
+        prev = getattr(self, "_last_workers_dict", {})
         self._table_model.update_workers(workers)
         n = len(workers)
         self.statusBar().showMessage(f"Воркеров: {n}")
-        # В лог только при изменении числа воркеров (избегаем спама при каждом опросе)
-        if getattr(self, "_last_workers_count", None) != n:
-            self._last_workers_count = n
-            self.append_log("Воркеров в реестре: %s" % n)
+
+        # Лог: подключения, отключения, смена статуса
+        for key in workers:
+            if key not in prev:
+                self.append_log("Воркер подключён: %s (статус: %s)" % (key, workers[key].get("status", "")))
+        for key in prev:
+            if key not in workers:
+                self.append_log("Воркер отключён: %s" % key)
+        for key in workers:
+            if key in prev:
+                old_s = prev[key].get("status", "")
+                new_s = workers[key].get("status", "")
+                if old_s != new_s:
+                    self.append_log("Воркер %s: статус %s → %s" % (key, old_s, new_s))
+
+        self._last_workers_dict = dict(workers)
+        self._update_resources_label(workers)
 
     def _on_poller_error(self, msg: str) -> None:
         self.append_log("Ошибка подключения к мастеру: " + msg)
         self.statusBar().showMessage(f"Ошибка: {msg}")
         self._table_model.update_workers({})
+        self._last_workers_dict = {}
 
 
 class WorkerTableModel(QtCore.QAbstractTableModel):

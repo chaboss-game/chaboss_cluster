@@ -22,6 +22,7 @@ DEFAULT = {
     "hf_model_id": "",
     "model_load_mode": "fit_in_cluster",  # fit_in_cluster | streaming_chunks
     "resource_usage_percent": 75,
+    "worker_config_path": "config/worker.yaml",
     "workers": [
         {"host": "127.0.0.1", "port": 60052, "auth_token": ""},
     ],
