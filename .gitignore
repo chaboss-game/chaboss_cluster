@@ -1,6 +1,16 @@
 # Локальный конфиг мастера (список воркеров, ключи — не коммитить)
 config/master.yaml
 
+# Временные/автосейв файлы конфигов (редакторы)
+config/*.yaml~
+config/*.yml~
+config/#*#
+config/.#*
+config/*.swp
+config/*.swo
+config/*.tmp
+config/*.bak
+
 # Виртуальное окружение
 .myvenv/
 venv/

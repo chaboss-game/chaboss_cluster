@@ -412,13 +412,38 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 if not isinstance(state_dict, dict):
                     state_dict = getattr(state_dict, "state_dict", lambda: {})()
                 logger.info("state_dict загружен с диска, ключей=%d", len(state_dict))
+
+                # Если мастер прислал список ключей шарда — оставляем только их.
+                shard_keys = list(request.shard_keys) if request.shard_keys else []
+                if shard_keys:
+                    logger.info("Получены метки шарда (keys=%d). Фильтрация state_dict...", len(shard_keys))
+                    filtered = {k: state_dict[k] for k in shard_keys if k in state_dict}
+                    missing = len(shard_keys) - len(filtered)
+                    state_dict = filtered
+                    logger.info("Фильтрация завершена: keys=%d (missing=%d)", len(state_dict), missing)
+
+                approx_bytes = 0
+                try:
+                    approx_bytes = sum(
+                        int(v.numel()) * int(v.element_size())
+                        for v in state_dict.values()
+                        if hasattr(v, "numel") and hasattr(v, "element_size")
+                    )
+                except Exception:
+                    approx_bytes = 0
+
                 self._shards[shard_id] = state_dict
                 if state_dict and spec.model_id:
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
                 elapsed = time.perf_counter() - t0
-                logger.info("Ответ мастеру: модель с HF загружена на воркере, ключей=%d, время=%.2f с", len(state_dict), elapsed)
+                logger.info(
+                    "Ответ мастеру: HF->шард загружен на воркере, ключей=%d, ~%.1f МБ, время=%.2f с",
+                    len(state_dict),
+                    approx_bytes / (1024 * 1024) if approx_bytes else 0.0,
+                    elapsed,
+                )
             else:
                 return cluster_pb2.InitShardResponse(ok=False, error="Не задан источник весов")
         except Exception as e:  # noqa: BLE001

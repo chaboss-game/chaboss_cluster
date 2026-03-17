@@ -149,6 +149,13 @@ class MasterNode:
             wd.token_status = "OK"
         else:
             wd.token_status = "MISMATCH"
+        logger.info(
+            "Worker %s token check: expected=%s got=%s status=%s",
+            key,
+            expected or "<none>",
+            got or "<none>",
+            wd.token_status,
+        )
         self._registry.upsert(wd)
         with self._lock:
             self._channels[key] = channel
@@ -178,6 +185,13 @@ class MasterNode:
             wd.token_status = "OK"
         else:
             wd.token_status = "MISMATCH"
+        logger.info(
+            "Worker %s token check (reconnect): expected=%s got=%s status=%s",
+            key,
+            expected or "<none>",
+            got or "<none>",
+            wd.token_status,
+        )
         self._registry.upsert(wd)
         with self._lock:
             old_ch = self._channels.pop(key, None)
@@ -202,8 +216,11 @@ class MasterNode:
             with self._lock:
                 stub = self._stubs.get(worker_key)
 
+            # Всегда берём актуальный конфиг (включая auth_token) из desired/config.
+            current_cfg = self._get_worker_config(worker_key) or w_cfg
+
             if stub is None:
-                if self._reconnect_worker(w_cfg):
+                if self._reconnect_worker(current_cfg):
                     backoff_s = RECONNECT_BACKOFF_INITIAL_S
                 else:
                     self._registry.set_status(wid, WorkerStatus.RECONNECTING)
@@ -222,8 +239,12 @@ class MasterNode:
                     )
 
             try:
-                for _ in stub.HealthStream(ping_iterator(), timeout=30):
-                    self._registry.set_status(wid, WorkerStatus.ONLINE)
+                # Важно: это долгоживущий поток; дедлайн/timeout тут НЕ должен быть коротким,
+                # иначе мы гарантированно получим periodic DEADLINE_EXCEEDED и флаппинг статуса.
+                self._registry.set_status(wid, WorkerStatus.ONLINE)
+                for _ in stub.HealthStream(ping_iterator()):
+                    # Не дёргаем статус на каждый pong — он меняется только при переходах.
+                    pass
             except grpc.RpcError as e:
                 logger.warning("HealthStream RpcError for %s: %s", worker_key, e)
             except Exception as e:  # noqa: BLE001
@@ -248,7 +269,15 @@ class MasterNode:
         Без перезапуска мастера.
         """
         with self._lock:
-            new_desired = {f"{w.host}:{w.port}": w for w in workers}
+            prev_desired = dict(self._desired_worker_configs)
+            new_desired: Dict[str, WorkerConfig] = {}
+            for w in workers:
+                key = f"{w.host}:{w.port}"
+                # Защита от случайного "сброса" токена: если UI прислал пустой auth_token,
+                # сохраняем уже известный токен для этого воркера.
+                if (w.auth_token is None or w.auth_token == "") and key in prev_desired:
+                    w = WorkerConfig(host=w.host, port=w.port, auth_token=prev_desired[key].auth_token)
+                new_desired[key] = w
             to_remove = [k for k in self._channels if k not in new_desired]
             to_add = [(k, w_cfg) for k, w_cfg in new_desired.items() if k not in self._stubs]
             self._desired_worker_configs = new_desired
@@ -320,7 +349,7 @@ class MasterNode:
         Перед загрузкой выгружает текущую модель с воркеров (освобождение VRAM).
         Возвращает (ok, error_message).
         """
-        from cluster_core.master.model_loader import prepare_shards
+        from cluster_core.master.model_loader import prepare_shard_keys
 
         self.unload_model(None)
 
@@ -335,25 +364,25 @@ class MasterNode:
             return False, "Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))
 
         logger.info(
-            "Загрузка модели %s: подготовка чанков на мастере (HF -> кэш, разбивка по слоям), воркеров=%d",
+            "Загрузка модели %s: подготовка меток шардов на мастере (HF -> кэш, разбивка по слоям), воркеров=%d",
             hf_model_id, len(worker_keys),
         )
         try:
-            shards = prepare_shards(hf_model_id, len(worker_keys))
+            shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys))
         except Exception as e:  # noqa: BLE001
-            logger.exception("prepare_shards failed for %s: %s", hf_model_id, e)
+            logger.exception("prepare_shard_keys failed for %s: %s", hf_model_id, e)
             return False, str(e)
 
-        logger.info("Чанки подготовлены, рассылка воркерам: %s", worker_keys)
+        logger.info("Метки шардов подготовлены, команда воркерам скачать с HF: %s", worker_keys)
         errors: list[str] = []
         for i, key in enumerate(worker_keys):
             stub = self._stubs.get(key)
             if stub is None:
-                logger.warning("Воркер %s: нет соединения, пропуск чанка %d", key, i)
+                logger.warning("Воркер %s: нет соединения, пропуск шарда %d", key, i)
                 errors.append(f"{key}: нет соединения")
                 continue
-            blob = shards[i] if i < len(shards) else b""
-            logger.info("Отправка чанка %d воркеру %s (размер %d байт)", i, key, len(blob))
+            shard_keys = shard_keys_list[i] if i < len(shard_keys_list) else []
+            logger.info("Команда воркеру %s: скачать с HF и загрузить shard=%d (keys=%d)", key, i, len(shard_keys))
             wid = _parse_worker_id(key)
             req = cluster_pb2.InitShardRequest(
                 spec=cluster_pb2.ShardSpec(
@@ -361,18 +390,19 @@ class MasterNode:
                     shard_id=str(i),
                     backend="baseline",
                 ),
-                weight_source="inline_blob",
-                inline_blob=blob,
+                weight_source="hf",
+                hf_model_name=hf_model_id,
+                shard_keys=shard_keys,
             )
             try:
                 resp = stub.InitShard(req, timeout=120.0)
                 if not resp.ok:
-                    logger.warning("Воркер %s: ошибка загрузки чанка: %s", key, resp.error)
+                    logger.warning("Воркер %s: ошибка загрузки шарда: %s", key, resp.error)
                     errors.append(f"{key}: {resp.error}")
                 else:
-                    logger.info("Воркер %s: чанк загружен успешно", key)
+                    logger.info("Воркер %s: шард загружен успешно", key)
             except Exception as e:  # noqa: BLE001
-                logger.warning("Воркер %s: исключение при загрузке чанка: %s", key, e, exc_info=True)
+                logger.warning("Воркер %s: исключение при загрузке шарда: %s", key, e, exc_info=True)
                 errors.append(f"{key}: {e}")
 
         if errors:

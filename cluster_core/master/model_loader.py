@@ -201,3 +201,41 @@ def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
         len(result), hf_model_id, sizes, sum(sizes) / (1024 * 1024),
     )
     return result
+
+
+def prepare_shard_keys(hf_model_id: str, n_workers: int) -> List[List[str]]:
+    """
+    Подготавливает план шардирования (только ключи).
+    Мастер и воркеры будут скачивать веса из HF, а воркер загрузит только свой поднабор ключей.
+    """
+    if n_workers <= 0:
+        raise ValueError("n_workers должно быть >= 1")
+    state_dict = _state_dict_from_hf(hf_model_id)
+    keys = list(state_dict.keys())
+    logger.info("Подготовка меток (ключей) для шардов: keys=%d, workers=%d", len(keys), n_workers)
+
+    if any("transformer.h." in k for k in keys):
+        shard_dicts = _split_state_dict_by_gpt2_layers(state_dict, n_workers)
+        shard_type = "GPT-2 (transformer.h)"
+    elif any("model.layers." in k for k in keys):
+        shard_dicts = _split_state_dict_by_llama_layers(state_dict, n_workers)
+        shard_type = "LLaMA (model.layers)"
+    elif any("encoder.layer." in k or "bert.encoder.layer." in k for k in keys):
+        shard_dicts = _split_state_dict_by_bert_layers(state_dict, n_workers)
+        shard_type = "BERT (encoder.layer)"
+    else:
+        shard_dicts = []
+        shard_type = None
+
+    if not shard_dicts:
+        shard_dicts = _split_state_dict(state_dict, n_workers)
+    else:
+        logger.info("Sharding by %s for %s (keys-only)", shard_type or "layers", hf_model_id)
+        while len(shard_dicts) < n_workers:
+            shard_dicts.append({})
+        shard_dicts = shard_dicts[:n_workers]
+
+    # Освобождаем память: нам нужны только ключи
+    key_lists: List[List[str]] = [sorted(sd.keys()) for sd in shard_dicts]
+    logger.info("Подготовлены shard_keys для %d шардов (пример: shard0=%d keys)", len(key_lists), len(key_lists[0]) if key_lists else 0)
+    return key_lists

@@ -71,6 +71,7 @@ message InitShardRequest {
   string hf_model_name = 3;
   string shared_path = 4;
   bytes inline_blob = 5;
+  repeated string shard_keys = 6; // если задано — воркер загружает только эти ключи state_dict
 }
 
 message InitShardResponse {
