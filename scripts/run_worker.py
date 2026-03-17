@@ -30,10 +30,11 @@ def main() -> None:
 
     host = cfg.get("listen_host", "0.0.0.0")
     port = int(cfg.get("listen_port", 50052))
+    auth_token = cfg.get("auth_token") or None
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
 
-    worker_service = WorkerService(host=host, port=port)
+    worker_service = WorkerService(host=host, port=port, auth_token=auth_token)
     from cluster_core.grpc import cluster_pb2_grpc
 
     cluster_pb2_grpc.add_WorkerServiceServicer_to_server(worker_service, server)

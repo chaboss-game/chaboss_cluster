@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 try:
     import grpc
@@ -30,6 +30,7 @@ from .settings_store import load as load_settings, save as save_settings
 
 DEFAULT_MASTER_ADDR = "127.0.0.1:60051"
 POLL_INTERVAL_MS = 3000
+WORKER_VISIBILITY_POLL_MS = 5000  # опрос мастера в режиме воркера: виден ли воркер в реестре
 AUTOSAVE_DELAY_MS = 500
 
 MODEL_LOAD_MODES = [
@@ -51,6 +52,8 @@ def _worker_list_to_dict(worker_list) -> Dict[str, dict]:
         key = f"{w.id.host}:{w.id.port}"
         out[key] = {
             "status": _STATUS_NAMES.get(w.status, "UNKNOWN"),
+            "token_status": getattr(w, "token_status", "") or "",
+            "os": ((getattr(w.resources, "os_name", "") or "") + " " + (getattr(w.resources, "os_version", "") or "")).strip(),
             "cpu_cores": w.resources.cpu_cores,
             "ram_total_mb": w.resources.ram_total_mb,
             "ram_available_mb": w.resources.ram_available_mb,
@@ -86,6 +89,7 @@ class MainWindow(QtWidgets.QMainWindow):
     unload_finished = QtCore.pyqtSignal(bool, str)
     apply_workers_finished = QtCore.pyqtSignal(bool, str)
     log_message = QtCore.pyqtSignal(str)  # сообщение для вкладки «Лог» (с меткой времени добавляется в слоте)
+    worker_master_status = QtCore.pyqtSignal(str, str)  # (ключ воркера или "", статус в реестре мастера)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
@@ -94,6 +98,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.unload_finished.connect(self._on_unload_finished)
         self.apply_workers_finished.connect(self._on_apply_workers_finished)
         self.log_message.connect(self._append_log_line)
+        self.worker_master_status.connect(self._on_worker_master_status)
 
         settings = load_settings()
         self._addr = (
@@ -105,6 +110,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_workers_dict: Dict[str, dict] = {}
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._on_timer)
+        self._worker_visibility_timer = QtCore.QTimer(self)
+        self._worker_visibility_timer.timeout.connect(self._poll_worker_visibility)
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_settings)
@@ -150,6 +157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker_panel_layout.addStretch()
         self._worker_panel.setLayout(worker_panel_layout)
 
+        self._worker_master_status_text = ""  # строка для подстановки в панель воркера
         self._cluster_stack = QtWidgets.QStackedWidget()
         self._cluster_stack.addWidget(table_container)   # индекс 0: вид «мастер» (таблица воркеров)
         self._cluster_stack.addWidget(self._worker_panel)  # индекс 1: вид «воркер»
@@ -459,6 +467,54 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._master_process is None:
             QtCore.QTimer.singleShot(500, self._on_start_master)
 
+    def _refresh_worker_status_label(self) -> None:
+        """Обновить текст панели воркера (процесс + статус в реестре мастера)."""
+        port = self._worker_display_port if hasattr(self, "_worker_display_port") else None
+        pid = getattr(self._worker_process, "pid", None) if getattr(self, "_worker_process", None) else None
+        lines = [
+            "Режим: Воркер",
+            "Порт: %s" % (port or "—"),
+            "Статус: работает (PID %s)" % (pid or "—") if pid is not None else "Статус: не запущен",
+        ]
+        if getattr(self, "_worker_master_status_text", ""):
+            lines.append(self._worker_master_status_text)
+        self._worker_status_label.setText("\n".join(lines))
+
+    def _poll_worker_visibility(self) -> None:
+        """В фоне опросить мастер (ListWorkers) и проверить, виден ли наш воркер по порту."""
+        port = getattr(self, "_worker_display_port", None)
+        addr = getattr(self, "_addr", DEFAULT_MASTER_ADDR)
+        if not port:
+            return
+
+        def do_poll() -> None:
+            try:
+                channel = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                response = stub.ListWorkers(cluster_pb2.Empty(), timeout=5.0)
+                channel.close()
+                workers = _worker_list_to_dict(response)
+                suffix = ":%s" % port
+                for key, w in workers.items():
+                    if key.endswith(suffix):
+                        status = w.get("status", "UNKNOWN")
+                        self.worker_master_status.emit(key, status)
+                        return
+                self.worker_master_status.emit("", "не найден")
+            except Exception as e:
+                self.worker_master_status.emit("", "ошибка: %s" % (e if len(str(e)) < 60 else str(e)[:57] + "..."))
+
+        threading.Thread(target=do_poll, daemon=True).start()
+
+    def _on_worker_master_status(self, worker_key: str, status: str) -> None:
+        """Обновить строку «В реестре мастера» и перерисовать панель воркера."""
+        if worker_key:
+            self._worker_master_status_text = "В реестре мастера: %s (%s)" % (status, worker_key)
+        else:
+            self._worker_master_status_text = "В реестре мастера: %s" % status
+        if getattr(self, "_worker_process", None) is not None and self._worker_process.poll() is None:
+            self._refresh_worker_status_label()
+
     def _update_process_state(self) -> None:
         """Обновить вид кластера и блокировки: мастер и воркер взаимоисключающие."""
         master_running = self._master_process is not None and self._master_process.poll() is None
@@ -466,11 +522,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if worker_running:
             self._cluster_stack.setCurrentIndex(1)
-            self._worker_status_label.setText(
-                "Режим: Воркер\nПорт: %s\nСтатус: работает (PID %s)"
-                % (self._worker_display_port or "—", getattr(self._worker_process, "pid", ""))
-            )
+            self._worker_master_status_text = "В реестре мастера: проверка..."
+            self._refresh_worker_status_label()
             self._timer.stop()
+            self._worker_visibility_timer.start(WORKER_VISIBILITY_POLL_MS)
+            self._poll_worker_visibility()
             self._start_master_btn.setEnabled(False)
             self._stop_master_btn.setEnabled(False)
             self._restart_master_btn.setEnabled(False)
@@ -483,6 +539,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._restart_worker_btn.setEnabled(True)
         elif master_running:
             self._cluster_stack.setCurrentIndex(0)
+            self._worker_visibility_timer.stop()
             self._timer.start(POLL_INTERVAL_MS)
             self._start_master_btn.setEnabled(True)
             self._stop_master_btn.setEnabled(True)
@@ -496,7 +553,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._restart_worker_btn.setEnabled(False)
         else:
             self._cluster_stack.setCurrentIndex(0)
+            self._worker_master_status_text = ""
             self._worker_status_label.setText("Режим: Воркер\nПорт: —\nСтатус: не запущен")
+            self._worker_visibility_timer.stop()
             self._timer.start(POLL_INTERVAL_MS)
             self._start_master_btn.setEnabled(True)
             self._stop_master_btn.setEnabled(True)
@@ -751,6 +810,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_workers_dict = dict(workers)
         self._update_resources_label(workers)
 
+        # Блокировка работы с моделью при несоответствии токенов
+        mismatched = [k for k, w in workers.items() if (w.get("token_status") or "") == "MISMATCH"]
+        if mismatched:
+            self.append_log("Token mismatch у воркеров: " + ", ".join(sorted(mismatched)) + " — работа с моделью запрещена")
+            try:
+                self._model_edit.setEnabled(False)
+            except Exception:
+                pass
+        else:
+            self._model_edit.setEnabled(True)
+
     def _on_poller_error(self, msg: str) -> None:
         self.append_log("Ошибка подключения к мастеру: " + msg)
         self.statusBar().showMessage(f"Ошибка: {msg}")
@@ -759,7 +829,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 class WorkerTableModel(QtCore.QAbstractTableModel):
-    HEADERS = ["ID", "Status", "CPU", "RAM свободно / всего (MB)", "GPUs"]
+    HEADERS = ["ID", "Status", "Token", "OS", "CPU", "RAM свободно / всего (MB)", "GPUs"]
 
     def __init__(self, workers: Dict[str, dict] | None = None) -> None:
         super().__init__()
@@ -779,24 +849,45 @@ class WorkerTableModel(QtCore.QAbstractTableModel):
         return len(self.HEADERS)
 
     def data(self, index: QtCore.QModelIndex, role: int = QtCore.Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or role != QtCore.Qt.ItemDataRole.DisplayRole:
+        if not index.isValid():
             return None
         worker_key = self._keys[index.row()]
         w = self._workers.get(worker_key, {})
+        if role == QtCore.Qt.ItemDataRole.BackgroundRole:
+            os_s = (w.get("os", "") or "").lower()
+            # Windows — синий, Ubuntu/Kubuntu — зелёный, macOS — жёлтый, остальные — нейтральный серый.
+            if "windows" in os_s:
+                color = QtGui.QColor("#dbeafe")  # light blue
+            elif "ubuntu" in os_s or "kubuntu" in os_s:
+                color = QtGui.QColor("#dcfce7")  # light green
+            elif "darwin" in os_s or "mac" in os_s or "macos" in os_s:
+                color = QtGui.QColor("#fef9c3")  # light yellow
+            elif "linux" in os_s:
+                color = QtGui.QColor("#ecfccb")  # light lime
+            else:
+                color = QtGui.QColor("#f3f4f6")  # light gray
+            return QtGui.QBrush(color)
+        if role != QtCore.Qt.ItemDataRole.DisplayRole:
+            return None
         col = index.column()
         if col == 0:
             return worker_key
         if col == 1:
             return w.get("status", "")
         if col == 2:
-            return str(w.get("cpu_cores", ""))
+            ts = w.get("token_status", "") or ""
+            return ts or "—"
         if col == 3:
+            return w.get("os", "") or "—"
+        if col == 4:
+            return str(w.get("cpu_cores", ""))
+        if col == 5:
             avail = w.get("ram_available_mb")
             total = w.get("ram_total_mb")
             if avail is not None and total is not None:
                 return f"{avail} / {total}"
             return str(total or avail or "")
-        if col == 4:
+        if col == 6:
             gpus = w.get("gpus", [])
             return ", ".join(str(g.get("name", "")) for g in gpus) if gpus else "—"
         return ""

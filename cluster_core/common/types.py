@@ -30,6 +30,8 @@ class ResourceInfo:
     torch_version: Optional[str] = None
     cuda_version: Optional[str] = None
     rocm_version: Optional[str] = None
+    os_name: Optional[str] = None
+    os_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -46,5 +48,7 @@ class WorkerDescriptor:
     worker_id: WorkerId
     status: WorkerStatus
     resources: ResourceInfo
+    token_fingerprint: Optional[str] = None
+    token_status: Optional[str] = None  # OK | MISMATCH | NONE | UNKNOWN
     labels: Dict[str, str] = field(default_factory=dict)
 

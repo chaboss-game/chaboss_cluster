@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import re
 import subprocess
+import platform
+import hashlib
 import psutil
 from typing import Any, Dict, Iterator, List
 
@@ -273,6 +275,8 @@ def _detect_resources() -> ResourceInfo:
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda if torch.version.cuda is not None else None,
         rocm_version=None,
+        os_name=platform.system().lower(),
+        os_version=f"{platform.release()} {platform.version()}".strip(),
     )
 
 
@@ -282,10 +286,13 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
     HealthStream, RunStage (forward по модулю или identity).
     """
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, auth_token: str | None = None) -> None:
         super().__init__()
         self._host = host
         self._port = port
+        self._auth_token_fingerprint = (
+            hashlib.sha256(auth_token.encode("utf-8")).hexdigest()[:12] if auth_token else ""
+        )
         self._resources = _detect_resources()
         self._shards: Dict[str, Dict[str, Any]] = {}  # shard_id -> state_dict chunk
         self._shard_modules: Dict[str, nn.Module] = {}  # shard_id -> nn.Module (BERT layers и т.д.)
@@ -314,6 +321,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             torch_version=self._resources.torch_version or "",
             cuda_version=self._resources.cuda_version or "",
             rocm_version=self._resources.rocm_version or "",
+            os_name=self._resources.os_name or "",
+            os_version=self._resources.os_version or "",
         )
 
     # RPC methods
@@ -328,6 +337,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             id=self._to_worker_id(),
             status=cluster_pb2.WORKER_STATUS_ONLINE,
             resources=self._to_resource_info(),
+            token_fingerprint=self._auth_token_fingerprint,
+            token_status="UNKNOWN",
         )
 
     def InitShard(

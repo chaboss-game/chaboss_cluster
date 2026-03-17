@@ -32,12 +32,16 @@ message ResourceInfo {
   string torch_version = 5;
   string cuda_version = 6;
   string rocm_version = 7;
+  string os_name = 8;     // linux | windows | darwin | ...
+  string os_version = 9;  // kernel/build/version string
 }
 
 message WorkerDescriptor {
   WorkerId id = 1;
   WorkerStatus status = 2;
   ResourceInfo resources = 3;
+  string token_fingerprint = 4; // short hash, not the token itself
+  string token_status = 5;      // OK | MISMATCH | NONE | UNKNOWN
 }
 
 // Tensor transport

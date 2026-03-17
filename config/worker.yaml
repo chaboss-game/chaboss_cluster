@@ -1,6 +1,6 @@
-listen_host: "0.0.0.0"
-listen_port: 60052
+listen_host: "192.168.0.110"
+listen_port: 44444
 
 # Optional authentication token that master must present when connecting.
-auth_token: null
+auth_token: kubuntu25_test
 

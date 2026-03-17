@@ -38,11 +38,15 @@ def _worker_descriptor_to_proto(wd: WorkerDescriptor) -> cluster_pb2.WorkerDescr
         torch_version=wd.resources.torch_version or "",
         cuda_version=wd.resources.cuda_version or "",
         rocm_version=wd.resources.rocm_version or "",
+        os_name=wd.resources.os_name or "",
+        os_version=wd.resources.os_version or "",
     )
     return cluster_pb2.WorkerDescriptor(
         id=cluster_pb2.WorkerId(host=wd.worker_id.host, port=wd.worker_id.port),
         status=_STATUS_TO_PROTO.get(wd.status, cluster_pb2.WORKER_STATUS_OFFLINE),
         resources=resources,
+        token_fingerprint=wd.token_fingerprint or "",
+        token_status=wd.token_status or "UNKNOWN",
     )
 
 

@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import uuid
+import hashlib
 from typing import Dict, List
 
 import grpc
@@ -51,13 +52,21 @@ def _descriptor_from_proto(desc: cluster_pb2.WorkerDescriptor) -> WorkerDescript
         torch_version=desc.resources.torch_version or None,
         cuda_version=desc.resources.cuda_version or None,
         rocm_version=desc.resources.rocm_version or None,
+        os_name=desc.resources.os_name or None,
+        os_version=desc.resources.os_version or None,
     )
     worker_id = WorkerId(host=desc.id.host, port=desc.id.port)
     return WorkerDescriptor(
         worker_id=worker_id,
         status=WorkerStatus.ONLINE,
         resources=resources,
+        token_fingerprint=desc.token_fingerprint or None,
+        token_status=desc.token_status or None,
     )
+
+
+def _token_fingerprint(token: str | None) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12] if token else ""
 
 
 class MasterNode:
@@ -132,6 +141,14 @@ class MasterNode:
             return
 
         wd = _descriptor_from_proto(desc)
+        expected = _token_fingerprint(w_cfg.auth_token)
+        got = wd.token_fingerprint or ""
+        if not expected and not got:
+            wd.token_status = "NONE"
+        elif expected == got:
+            wd.token_status = "OK"
+        else:
+            wd.token_status = "MISMATCH"
         self._registry.upsert(wd)
         with self._lock:
             self._channels[key] = channel
@@ -153,6 +170,14 @@ class MasterNode:
             return False
 
         wd = _descriptor_from_proto(desc)
+        expected = _token_fingerprint(w_cfg.auth_token)
+        got = wd.token_fingerprint or ""
+        if not expected and not got:
+            wd.token_status = "NONE"
+        elif expected == got:
+            wd.token_status = "OK"
+        else:
+            wd.token_status = "MISMATCH"
         self._registry.upsert(wd)
         with self._lock:
             old_ch = self._channels.pop(key, None)
@@ -303,6 +328,11 @@ class MasterNode:
             worker_keys = list(self._stubs.keys())
         if not worker_keys:
             return False, "Нет подключённых воркеров"
+
+        # Запрет работы с моделью при несоответствии токенов
+        bad = [k for k, wd in self._registry.all().items() if (wd.token_status or "") == "MISMATCH"]
+        if bad:
+            return False, "Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))
 
         try:
             shards = prepare_shards(hf_model_id, len(worker_keys))
