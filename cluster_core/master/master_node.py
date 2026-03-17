@@ -29,6 +29,14 @@ RECONNECT_BACKOFF_MAX_S = 30.0
 GET_STATUS_TIMEOUT_S = 15.0  # таймаут GetStatus при подключении/переподключении (медленная сеть или загрузка воркера)
 INIT_SHARD_TIMEOUT_S = 900.0  # таймаут InitShard на воркере: скачивание с HF + загрузка шарда для больших моделей (до 15 мин)
 
+# Keepalive для долгоживущих каналов к воркерам (снижает реконнекты из-за NAT/файрвола).
+WORKER_CHANNEL_OPTIONS = [
+    ("grpc.keepalive_time_ms", 15_000),  # пинг каждые 15 с
+    ("grpc.keepalive_timeout_ms", 5_000),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.http2.max_pings_without_data", 0),
+]
+
 
 def _parse_worker_id(key: str) -> WorkerId:
     host, port_str = key.rsplit(":", 1)
@@ -125,7 +133,7 @@ class MasterNode:
         target = f"{w_cfg.host}:{w_cfg.port}"
         key = target
         logger.info("Connecting to worker %s", target)
-        channel = grpc.insecure_channel(target)
+        channel = grpc.insecure_channel(target, options=WORKER_CHANNEL_OPTIONS)
         stub = cluster_pb2_grpc.WorkerServiceStub(channel)
 
         worker_id_pb = cluster_pb2.WorkerId(host=w_cfg.host, port=w_cfg.port)
@@ -168,7 +176,7 @@ class MasterNode:
         """Создать новый channel/stub, GetStatus, обновить реестр и _channels/_stubs."""
         target = f"{w_cfg.host}:{w_cfg.port}"
         key = target
-        channel = grpc.insecure_channel(target)
+        channel = grpc.insecure_channel(target, options=WORKER_CHANNEL_OPTIONS)
         stub = cluster_pb2_grpc.WorkerServiceStub(channel)
         worker_id_pb = cluster_pb2.WorkerId(host=w_cfg.host, port=w_cfg.port)
         try:

@@ -32,7 +32,17 @@ def main() -> None:
     port = int(cfg.get("listen_port", 50052))
     auth_token = cfg.get("auth_token") or None
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    # Keepalive: разрешаем пинги без активных RPC, чтобы долгоживущий HealthStream не обрывался.
+    server_options = [
+        ("grpc.keepalive_time_ms", 15_000),
+        ("grpc.keepalive_timeout_ms", 5_000),
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.max_pings_without_data", 0),
+    ]
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=8),
+        options=server_options,
+    )
 
     worker_service = WorkerService(host=host, port=port, auth_token=auth_token)
     from cluster_core.grpc import cluster_pb2_grpc

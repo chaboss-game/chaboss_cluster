@@ -822,14 +822,34 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 channel = grpc.insecure_channel(self._addr)
                 stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
-                stream = stub.LoadModelStream(
-                    cluster_pb2.LoadModelRequest(hf_model_id=model_id),
-                )
-                for ev in stream:
-                    self.load_progress_event.emit(ev)
-                    if ev.done:
+                try:
+                    stream = stub.LoadModelStream(
+                        cluster_pb2.LoadModelRequest(hf_model_id=model_id),
+                    )
+                    for ev in stream:
+                        self.load_progress_event.emit(ev)
+                        if ev.done:
+                            self.load_finished.emit(ev.ok, ev.error or "")
+                            break
+                except grpc.RpcError as rpc_err:
+                    # Мастер без LoadModelStream (старая версия) — fallback на LoadModel
+                    if rpc_err.code() == grpc.StatusCode.UNIMPLEMENTED or "Method not found" in (rpc_err.details() or ""):
+                        self.load_progress_event.emit(
+                            cluster_pb2.LoadModelProgressEvent(
+                                master=cluster_pb2.LoadProgress(stage="download", percent=0),
+                            )
+                        )
+                        resp = stub.LoadModel(
+                            cluster_pb2.LoadModelRequest(hf_model_id=model_id),
+                            timeout=3600.0,
+                        )
+                        ev = cluster_pb2.LoadModelProgressEvent(
+                            done=True, ok=resp.ok, error=resp.error or ""
+                        )
+                        self.load_progress_event.emit(ev)
                         self.load_finished.emit(ev.ok, ev.error or "")
-                        break
+                    else:
+                        raise
                 channel.close()
             except Exception as e:
                 self.load_finished.emit(False, str(e))
