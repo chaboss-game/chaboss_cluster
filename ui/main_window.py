@@ -13,6 +13,7 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
+import re
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
@@ -84,6 +85,32 @@ class MasterPoller(QtCore.QObject):
             self.error.emit(str(e))
 
 
+_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_host_port(addr: str) -> tuple[bool, str]:
+    """
+    Валидация адреса мастера формата host:port.
+    Возвращает (ok, error_message).
+    """
+    a = (addr or "").strip()
+    if not a or ":" not in a:
+        return False, "Ожидается host:port (например, 127.0.0.1:60051)"
+    host, port_s = a.rsplit(":", 1)
+    host = host.strip()
+    port_s = port_s.strip()
+    if not host or not port_s:
+        return False, "Ожидается host:port (например, 127.0.0.1:60051)"
+    if not port_s.isdigit():
+        return False, "Порт должен быть числом (1–65535)"
+    port = int(port_s)
+    if port < 1 or port > 65535:
+        return False, "Порт должен быть в диапазоне 1–65535"
+    if not _HOST_RE.match(host):
+        return False, "Некорректный host (разрешены буквы/цифры/.-_)"
+    return True, ""
+
+
 class MainWindow(QtWidgets.QMainWindow):
     load_finished = QtCore.pyqtSignal(bool, str)
     unload_finished = QtCore.pyqtSignal(bool, str)
@@ -93,7 +120,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("Cluster Master UI")
+        self.setWindowTitle("Chaboss Cluster")
         self.load_finished.connect(self._on_load_finished)
         self.unload_finished.connect(self._on_unload_finished)
         self.apply_workers_finished.connect(self._on_apply_workers_finished)
@@ -409,6 +436,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_master_addr_from_edit(self) -> None:
         addr = self._master_edit.text().strip() or DEFAULT_MASTER_ADDR
+        ok, err = _validate_host_port(addr)
+        if not ok:
+            self.append_log("Некорректный адрес мастера: %s (%s)" % (addr, err))
+            return
         if addr != self._addr:
             self._addr = addr
             self._poller.set_master_addr(addr)
@@ -485,6 +516,10 @@ class MainWindow(QtWidgets.QMainWindow):
         port = getattr(self, "_worker_display_port", None)
         addr = getattr(self, "_addr", DEFAULT_MASTER_ADDR)
         if not port:
+            return
+        ok, err = _validate_host_port(addr)
+        if not ok:
+            self.worker_master_status.emit("", f"ошибка адреса мастера: {err}")
             return
 
         def do_poll() -> None:
@@ -717,6 +752,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Диалог при ошибке загрузки модели с подсказками по ресурсам и режиму."""
         msg = (
             "Ошибка загрузки модели:\n\n%s\n\n"
+            "Подробные причины смотрите в логах мастера и воркеров "
+            "(консоль, где запущены master/worker, или журнал приложения).\n\n"
             "Рекомендации:\n"
             "• Если модель не влезает в выбранный %% свободных ресурсов — увеличьте "
             "«Использование свободных ресурсов (%%)» в настройках (например, до 80–90%%).\n"

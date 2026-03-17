@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 import subprocess
 import platform
 import hashlib
 import psutil
+import time
 from typing import Any, Dict, Iterator, List
 
 import grpc
@@ -15,6 +17,8 @@ import torch.nn as nn
 from cluster_core.common.tensor_io import payload_to_tensor, tensor_to_payload
 from cluster_core.common.types import GpuInfo, ResourceInfo, WorkerDescriptor, WorkerId, WorkerStatus
 from cluster_core.grpc import cluster_pb2, cluster_pb2_grpc
+
+logger = logging.getLogger("worker.service")
 
 # Паттерны ключей по архитектурам
 _LAYER_PREFIX_RE = re.compile(r"^(?:bert\.)?encoder\.layer\.(\d+)\.")
@@ -346,12 +350,20 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         request: cluster_pb2.InitShardRequest,
         context: grpc.ServicerContext,
     ) -> cluster_pb2.InitShardResponse:
+        t0 = time.perf_counter()
         spec = request.spec
         shard_id = f"{spec.model_id}:{spec.shard_id}"
+        logger.info(
+            "InitShard: получена команда — model_id=%s, shard_id=%s, source=%s",
+            spec.model_id, spec.shard_id, request.weight_source,
+        )
         try:
             if request.weight_source == "inline_blob":
+                blob_size = len(request.inline_blob) if request.inline_blob else 0
+                logger.info("Получен inline_blob от мастера, размер=%d байт (метка шарда: %s)", blob_size, shard_id)
                 state_dict = {}
                 if request.inline_blob:
+                    logger.info("Загрузка state_dict из blob...")
                     state_dict = torch.load(
                         io.BytesIO(request.inline_blob),
                         map_location="cpu",
@@ -359,13 +371,23 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     )
                     if not isinstance(state_dict, dict):
                         return cluster_pb2.InitShardResponse(ok=False, error="Ожидался state_dict (dict)")
+                    logger.info("state_dict загружен из blob, ключей=%d", len(state_dict))
                 self._shards[shard_id] = state_dict
-                # Попытка собрать модуль для forward (BERT-слои)
                 if state_dict and spec.model_id:
+                    logger.info("Сборка модуля слоёв для model_id=%s...", spec.model_id)
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
+                        logger.info("Модуль слоёв собран успешно")
+                    else:
+                        logger.info("Модуль слоёв не собран (будут только веса)")
+                elapsed = time.perf_counter() - t0
+                logger.info(
+                    "Ответ мастеру: чанк загружен успешно, размер=%d байт, время=%.2f с",
+                    blob_size, elapsed,
+                )
             elif request.weight_source == "shared_path" and request.shared_path:
+                logger.info("Загрузка шарда из shared_path: %s", request.shared_path)
                 state_dict = torch.load(
                     request.shared_path,
                     map_location="cpu",
@@ -378,20 +400,30 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
+                elapsed = time.perf_counter() - t0
+                logger.info("Ответ мастеру: шард из shared_path загружен, ключей=%d, время=%.2f с", len(state_dict), elapsed)
             elif request.weight_source == "hf" and request.hf_model_name:
+                logger.info("Получена команда скачать модель с HF: %s", request.hf_model_name)
                 from huggingface_hub import hf_hub_download
+                logger.info("Начало скачивания с HuggingFace...")
                 path = hf_hub_download(repo_id=request.hf_model_name, filename="pytorch_model.bin")
+                logger.info("Скачивание с HF завершено: %s", path)
                 state_dict = torch.load(path, map_location="cpu", weights_only=True)
                 if not isinstance(state_dict, dict):
                     state_dict = getattr(state_dict, "state_dict", lambda: {})()
+                logger.info("state_dict загружен с диска, ключей=%d", len(state_dict))
                 self._shards[shard_id] = state_dict
                 if state_dict and spec.model_id:
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
+                elapsed = time.perf_counter() - t0
+                logger.info("Ответ мастеру: модель с HF загружена на воркере, ключей=%d, время=%.2f с", len(state_dict), elapsed)
             else:
                 return cluster_pb2.InitShardResponse(ok=False, error="Не задан источник весов")
         except Exception as e:  # noqa: BLE001
+            elapsed = time.perf_counter() - t0
+            logger.exception("InitShard failed за %.2f с: %s", elapsed, e)
             return cluster_pb2.InitShardResponse(ok=False, error=str(e))
         return cluster_pb2.InitShardResponse(ok=True, error="")
 

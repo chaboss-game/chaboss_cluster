@@ -334,18 +334,26 @@ class MasterNode:
         if bad:
             return False, "Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))
 
+        logger.info(
+            "Загрузка модели %s: подготовка чанков на мастере (HF -> кэш, разбивка по слоям), воркеров=%d",
+            hf_model_id, len(worker_keys),
+        )
         try:
             shards = prepare_shards(hf_model_id, len(worker_keys))
         except Exception as e:  # noqa: BLE001
-            logger.exception("prepare_shards failed for %s", hf_model_id)
+            logger.exception("prepare_shards failed for %s: %s", hf_model_id, e)
             return False, str(e)
 
+        logger.info("Чанки подготовлены, рассылка воркерам: %s", worker_keys)
         errors: list[str] = []
         for i, key in enumerate(worker_keys):
             stub = self._stubs.get(key)
             if stub is None:
+                logger.warning("Воркер %s: нет соединения, пропуск чанка %d", key, i)
                 errors.append(f"{key}: нет соединения")
                 continue
+            blob = shards[i] if i < len(shards) else b""
+            logger.info("Отправка чанка %d воркеру %s (размер %d байт)", i, key, len(blob))
             wid = _parse_worker_id(key)
             req = cluster_pb2.InitShardRequest(
                 spec=cluster_pb2.ShardSpec(
@@ -354,13 +362,17 @@ class MasterNode:
                     backend="baseline",
                 ),
                 weight_source="inline_blob",
-                inline_blob=shards[i] if i < len(shards) else b"",
+                inline_blob=blob,
             )
             try:
                 resp = stub.InitShard(req, timeout=120.0)
                 if not resp.ok:
+                    logger.warning("Воркер %s: ошибка загрузки чанка: %s", key, resp.error)
                     errors.append(f"{key}: {resp.error}")
+                else:
+                    logger.info("Воркер %s: чанк загружен успешно", key)
             except Exception as e:  # noqa: BLE001
+                logger.warning("Воркер %s: исключение при загрузке чанка: %s", key, e, exc_info=True)
                 errors.append(f"{key}: {e}")
 
         if errors:

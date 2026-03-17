@@ -1,5 +1,5 @@
-listen_host: "0.0.0.0"
-listen_port: 60051
+listen_host: "192.168.0.111"
+listen_port: 66666
 
 # OpenAI-совместимый HTTP API (для OpenCLaw и др.)
 http_listen_host: "0.0.0.0"

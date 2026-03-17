@@ -21,8 +21,10 @@ def _state_dict_from_hf(model_id: str) -> dict:
     except ImportError:
         raise RuntimeError("Установите huggingface_hub: pip install huggingface_hub")
 
+    logger.info("Начало загрузки модели с HuggingFace: %s", model_id)
     cache_dir = snapshot_download(repo_id=model_id, allow_patterns=["*.bin", "*.safetensors", "*.msgpack"])
     path = Path(cache_dir)
+    logger.info("Модель загружена в локальное хранилище HF: %s", path)
 
     # Пробуем pytorch_model.bin или model.safetensors
     state_dict = None
@@ -66,6 +68,7 @@ def _state_dict_from_hf(model_id: str) -> dict:
             raise FileNotFoundError(
                 f"В репозитории {model_id} не найдены веса и не удалось загрузить через transformers: {e}"
             ) from e
+    logger.info("state_dict загружен из кэша: ключей=%d", len(state_dict))
     return state_dict
 
 
@@ -164,6 +167,7 @@ def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
         raise ValueError("n_workers должно быть >= 1")
     state_dict = _state_dict_from_hf(hf_model_id)
     keys = list(state_dict.keys())
+    logger.info("Начало разбивки state_dict по слоям для n_workers=%d", n_workers)
     # Выбор разбиения по слоям по префиксам ключей (приоритет: GPT-2, LLaMA, BERT)
     if any("transformer.h." in k for k in keys):
         shard_dicts = _split_state_dict_by_gpt2_layers(state_dict, n_workers)
@@ -191,5 +195,9 @@ def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
         buf.truncate()
         torch.save(sd, buf)
         result.append(buf.getvalue())
-    logger.info("Prepared %d shards for model %s", len(result), hf_model_id)
+    sizes = [len(r) for r in result]
+    logger.info(
+        "Чанки подготовлены и сериализованы: %d штук для модели %s, размеры (байт): %s, суммарно %.1f МБ",
+        len(result), hf_model_id, sizes, sum(sizes) / (1024 * 1024),
+    )
     return result
