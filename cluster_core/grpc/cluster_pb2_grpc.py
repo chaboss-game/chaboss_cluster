@@ -46,6 +46,11 @@ class WorkerServiceStub(object):
                 request_serializer=cluster__pb2.InitShardRequest.SerializeToString,
                 response_deserializer=cluster__pb2.InitShardResponse.FromString,
                 _registered_method=True)
+        self.UnloadShard = channel.unary_unary(
+                '/cluster.WorkerService/UnloadShard',
+                request_serializer=cluster__pb2.UnloadShardRequest.SerializeToString,
+                response_deserializer=cluster__pb2.UnloadShardResponse.FromString,
+                _registered_method=True)
         self.RunStage = channel.stream_stream(
                 '/cluster.WorkerService/RunStage',
                 request_serializer=cluster__pb2.StageRequest.SerializeToString,
@@ -75,6 +80,12 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UnloadShard(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def RunStage(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -99,6 +110,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.InitShard,
                     request_deserializer=cluster__pb2.InitShardRequest.FromString,
                     response_serializer=cluster__pb2.InitShardResponse.SerializeToString,
+            ),
+            'UnloadShard': grpc.unary_unary_rpc_method_handler(
+                    servicer.UnloadShard,
+                    request_deserializer=cluster__pb2.UnloadShardRequest.FromString,
+                    response_serializer=cluster__pb2.UnloadShardResponse.SerializeToString,
             ),
             'RunStage': grpc.stream_stream_rpc_method_handler(
                     servicer.RunStage,
@@ -167,6 +183,33 @@ class WorkerService(object):
             '/cluster.WorkerService/InitShard',
             cluster__pb2.InitShardRequest.SerializeToString,
             cluster__pb2.InitShardResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UnloadShard(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.WorkerService/UnloadShard',
+            cluster__pb2.UnloadShardRequest.SerializeToString,
+            cluster__pb2.UnloadShardResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -251,6 +294,11 @@ class MasterAdminServiceStub(object):
                 request_serializer=cluster__pb2.LoadModelRequest.SerializeToString,
                 response_deserializer=cluster__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
+        self.UnloadModel = channel.unary_unary(
+                '/cluster.MasterAdminService/UnloadModel',
+                request_serializer=cluster__pb2.UnloadModelRequest.SerializeToString,
+                response_deserializer=cluster__pb2.UnloadModelResponse.FromString,
+                _registered_method=True)
         self.UpdateWorkersConfig = channel.unary_unary(
                 '/cluster.MasterAdminService/UpdateWorkersConfig',
                 request_serializer=cluster__pb2.UpdateWorkersConfigRequest.SerializeToString,
@@ -268,6 +316,12 @@ class MasterAdminServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def LoadModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UnloadModel(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -291,6 +345,11 @@ def add_MasterAdminServiceServicer_to_server(servicer, server):
                     servicer.LoadModel,
                     request_deserializer=cluster__pb2.LoadModelRequest.FromString,
                     response_serializer=cluster__pb2.LoadModelResponse.SerializeToString,
+            ),
+            'UnloadModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.UnloadModel,
+                    request_deserializer=cluster__pb2.UnloadModelRequest.FromString,
+                    response_serializer=cluster__pb2.UnloadModelResponse.SerializeToString,
             ),
             'UpdateWorkersConfig': grpc.unary_unary_rpc_method_handler(
                     servicer.UpdateWorkersConfig,
@@ -352,6 +411,33 @@ class MasterAdminService(object):
             '/cluster.MasterAdminService/LoadModel',
             cluster__pb2.LoadModelRequest.SerializeToString,
             cluster__pb2.LoadModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UnloadModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/UnloadModel',
+            cluster__pb2.UnloadModelRequest.SerializeToString,
+            cluster__pb2.UnloadModelResponse.FromString,
             options,
             channel_credentials,
             insecure,

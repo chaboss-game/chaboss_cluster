@@ -76,6 +76,17 @@ class MasterAdminService(cluster_pb2_grpc.MasterAdminServiceServicer):
         ok, err = self._master_node.load_model(request.hf_model_id.strip())
         return cluster_pb2.LoadModelResponse(ok=ok, error=err or "")
 
+    def UnloadModel(
+        self,
+        request: cluster_pb2.UnloadModelRequest,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.UnloadModelResponse:
+        if self._master_node is None:
+            return cluster_pb2.UnloadModelResponse(ok=False, error="Мастер не готов")
+        model_id = (request.model_id or "").strip() or None
+        ok, err = self._master_node.unload_model(model_id)
+        return cluster_pb2.UnloadModelResponse(ok=ok, error=err or "")
+
     def UpdateWorkersConfig(
         self,
         request: cluster_pb2.UpdateWorkersConfigRequest,

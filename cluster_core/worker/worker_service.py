@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import subprocess
 import psutil
 from typing import Any, Dict, Iterator, List
 
@@ -13,8 +14,10 @@ from cluster_core.common.tensor_io import payload_to_tensor, tensor_to_payload
 from cluster_core.common.types import GpuInfo, ResourceInfo, WorkerDescriptor, WorkerId, WorkerStatus
 from cluster_core.grpc import cluster_pb2, cluster_pb2_grpc
 
-# Паттерн ключей encoder.layer.N или bert.encoder.layer.N
+# Паттерны ключей по архитектурам
 _LAYER_PREFIX_RE = re.compile(r"^(?:bert\.)?encoder\.layer\.(\d+)\.")
+_LAYER_PREFIX_RE_GPT2 = re.compile(r"^transformer\.h\.(\d+)\.")
+_LAYER_PREFIX_RE_LLAMA = re.compile(r"^model\.layers\.(\d+)\.")
 
 
 def _layer_indices_from_state_dict(state_dict: dict) -> List[int]:
@@ -59,6 +62,185 @@ def _try_build_bert_layers_module(model_id: str, state_dict: dict) -> nn.Module 
     return nn.Sequential(*layers)
 
 
+def _layer_indices_from_state_dict_gpt2(state_dict: dict) -> List[int]:
+    """Индексы слоёв transformer.h.i (GPT-2)."""
+    indices = set()
+    for k in state_dict:
+        m = _LAYER_PREFIX_RE_GPT2.match(k)
+        if m:
+            indices.add(int(m.group(1)))
+    return sorted(indices)
+
+
+def _try_build_gpt2_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
+    """
+    Собирает nn.Module из state_dict для GPT-2 (transformer.h.i).
+    Возвращает Sequential из GPT2Block или None при ошибке.
+    """
+    try:
+        from transformers import GPT2Config, GPT2Block
+    except ImportError:
+        return None
+    indices = _layer_indices_from_state_dict_gpt2(state_dict)
+    if not indices:
+        return None
+    try:
+        config = GPT2Config.from_pretrained(model_id)
+    except Exception:
+        return None
+    layers: List[nn.Module] = []
+    prefix = "transformer.h."
+    for idx in indices:
+        prefix_full = f"{prefix}{idx}."
+        sub = {k[len(prefix_full):]: v for k, v in state_dict.items() if k.startswith(prefix_full)}
+        if not sub:
+            return None
+        layer = GPT2Block(config)
+        layer.load_state_dict(sub, strict=False)
+        layer.eval()
+        layers.append(layer)
+    return nn.Sequential(*layers)
+
+
+def _layer_indices_from_state_dict_llama(state_dict: dict) -> List[int]:
+    """Индексы слоёв model.layers.i (LLaMA)."""
+    indices = set()
+    for k in state_dict:
+        m = _LAYER_PREFIX_RE_LLAMA.match(k)
+        if m:
+            indices.add(int(m.group(1)))
+    return sorted(indices)
+
+
+def _try_build_llama_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
+    """
+    Собирает nn.Module из state_dict для LLaMA (model.layers.i).
+    Возвращает Sequential из LlamaDecoderLayer или None при ошибке.
+    """
+    try:
+        from transformers import LlamaConfig, LlamaDecoderLayer
+    except ImportError:
+        try:
+            from transformers.models.llama.modeling_llama import LlamaConfig, LlamaDecoderLayer
+        except ImportError:
+            return None
+    indices = _layer_indices_from_state_dict_llama(state_dict)
+    if not indices:
+        return None
+    try:
+        config = LlamaConfig.from_pretrained(model_id)
+    except Exception:
+        return None
+    layers: List[nn.Module] = []
+    prefix = "model.layers."
+    for idx in indices:
+        prefix_full = f"{prefix}{idx}."
+        sub = {k[len(prefix_full):]: v for k, v in state_dict.items() if k.startswith(prefix_full)}
+        if not sub:
+            return None
+        layer = LlamaDecoderLayer(config)
+        layer.load_state_dict(sub, strict=False)
+        layer.eval()
+        layers.append(layer)
+    return nn.Sequential(*layers)
+
+
+def _layer_indices_from_state_dict_qwen2(state_dict: dict) -> List[int]:
+    """Индексы слоёв model.layers.i (Qwen2, та же структура что у LLaMA)."""
+    return _layer_indices_from_state_dict_llama(state_dict)
+
+
+def _try_build_qwen2_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
+    """
+    Собирает nn.Module из state_dict для Qwen2 (model.layers.i).
+    Возвращает Sequential из Qwen2DecoderLayer или None при ошибке.
+    """
+    try:
+        from transformers import Qwen2Config, Qwen2DecoderLayer
+    except ImportError:
+        try:
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2Config, Qwen2DecoderLayer
+        except ImportError:
+            return None
+    indices = _layer_indices_from_state_dict_qwen2(state_dict)
+    if not indices:
+        return None
+    try:
+        config = Qwen2Config.from_pretrained(model_id)
+    except Exception:
+        return None
+    layers: List[nn.Module] = []
+    prefix = "model.layers."
+    for idx in indices:
+        prefix_full = f"{prefix}{idx}."
+        sub = {k[len(prefix_full):]: v for k, v in state_dict.items() if k.startswith(prefix_full)}
+        if not sub:
+            return None
+        layer = Qwen2DecoderLayer(config)
+        layer.load_state_dict(sub, strict=False)
+        layer.eval()
+        layers.append(layer)
+    return nn.Sequential(*layers)
+
+
+def _try_build_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
+    """
+    Пробует собрать Sequential слоёв по ключам state_dict.
+    Порядок: BERT -> GPT-2 -> LLaMA -> Qwen2.
+    """
+    if not state_dict or not model_id:
+        return None
+    module = _try_build_bert_layers_module(model_id, state_dict)
+    if module is not None:
+        return module
+    module = _try_build_gpt2_layers_module(model_id, state_dict)
+    if module is not None:
+        return module
+    module = _try_build_llama_layers_module(model_id, state_dict)
+    if module is not None:
+        return module
+    return _try_build_qwen2_layers_module(model_id, state_dict)
+
+
+def _detect_gpus_nvidia_smi() -> list[GpuInfo]:
+    """Резервное определение GPU через nvidia-smi (если PyTorch без CUDA)."""
+    gpus: list[GpuInfo] = []
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return gpus
+        for idx, line in enumerate(out.stdout.strip().split("\n")):
+            parts = [p.strip() for p in line.split(",", 1)]
+            name = parts[0] if parts else f"GPU {idx}"
+            total_mb = 0
+            if len(parts) > 1:
+                try:
+                    total_mb = int(parts[1].split()[0])
+                except (ValueError, IndexError):
+                    pass
+            gpus.append(
+                GpuInfo(
+                    index=idx,
+                    name=name,
+                    total_vram_mb=total_mb,
+                    compute_capability=None,
+                    backend="cuda",
+                )
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):  # noqa: BLE001, S110
+        pass
+    return gpus
+
+
 def _detect_resources() -> ResourceInfo:
     cpu_cores = psutil.cpu_count(logical=True) or 0
     vm = psutil.virtual_memory()
@@ -80,6 +262,8 @@ def _detect_resources() -> ResourceInfo:
                     backend="cuda",
                 )
             )
+    if not gpus:
+        gpus = _detect_gpus_nvidia_smi()
 
     return ResourceInfo(
         cpu_cores=cpu_cores,
@@ -167,7 +351,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 self._shards[shard_id] = state_dict
                 # Попытка собрать модуль для forward (BERT-слои)
                 if state_dict and spec.model_id:
-                    module = _try_build_bert_layers_module(spec.model_id, state_dict)
+                    module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
             elif request.weight_source == "shared_path" and request.shared_path:
@@ -180,7 +364,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     return cluster_pb2.InitShardResponse(ok=False, error="Ожидался state_dict (dict)")
                 self._shards[shard_id] = state_dict
                 if state_dict and spec.model_id:
-                    module = _try_build_bert_layers_module(spec.model_id, state_dict)
+                    module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
             elif request.weight_source == "hf" and request.hf_model_name:
@@ -191,7 +375,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     state_dict = getattr(state_dict, "state_dict", lambda: {})()
                 self._shards[shard_id] = state_dict
                 if state_dict and spec.model_id:
-                    module = _try_build_bert_layers_module(spec.model_id, state_dict)
+                    module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
             else:
@@ -199,6 +383,28 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         except Exception as e:  # noqa: BLE001
             return cluster_pb2.InitShardResponse(ok=False, error=str(e))
         return cluster_pb2.InitShardResponse(ok=True, error="")
+
+    def UnloadShard(
+        self,
+        request: cluster_pb2.UnloadShardRequest,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.UnloadShardResponse:
+        model_id = (request.model_id or "").strip()
+        shard_id = (request.shard_id or "").strip()
+        if not model_id and not shard_id:
+            keys_to_drop = list(self._shards.keys())
+        elif model_id and shard_id:
+            keys_to_drop = [f"{model_id}:{shard_id}"] if f"{model_id}:{shard_id}" in self._shards else []
+        elif model_id:
+            keys_to_drop = [k for k in self._shards if k.startswith(f"{model_id}:")]
+        else:
+            keys_to_drop = [k for k in self._shards if k.endswith(f":{shard_id}")]
+        for key in keys_to_drop:
+            self._shards.pop(key, None)
+            self._shard_modules.pop(key, None)
+        if keys_to_drop and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return cluster_pb2.UnloadShardResponse(ok=True, error="")
 
     def HealthStream(
         self,

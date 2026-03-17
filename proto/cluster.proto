@@ -74,6 +74,16 @@ message InitShardResponse {
   string error = 2;
 }
 
+message UnloadShardRequest {
+  string model_id = 1;   // пусто = все модели
+  string shard_id = 2;   // пусто = все шарды модели (или все при пустом model_id)
+}
+
+message UnloadShardResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 // Health / heartbeat
 
 message HealthPing {
@@ -109,6 +119,7 @@ message StageResponse {
 service WorkerService {
   rpc GetStatus(WorkerId) returns (WorkerDescriptor);
   rpc InitShard(InitShardRequest) returns (InitShardResponse);
+  rpc UnloadShard(UnloadShardRequest) returns (UnloadShardResponse);
   rpc RunStage(stream StageRequest) returns (stream StageResponse);
   rpc HealthStream(stream HealthPing) returns (stream HealthPong);
 }
@@ -145,9 +156,19 @@ message UpdateWorkersConfigResponse {
   string error = 2;
 }
 
+message UnloadModelRequest {
+  string model_id = 1;  // пусто = выгрузить текущую загруженную модель со всех воркеров
+}
+
+message UnloadModelResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 service MasterAdminService {
   rpc ListWorkers(Empty) returns (WorkerList);
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
   rpc UpdateWorkersConfig(UpdateWorkersConfigRequest) returns (UpdateWorkersConfigResponse);
 }
 

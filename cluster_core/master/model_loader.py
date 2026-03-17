@@ -7,7 +7,7 @@ from __future__ import annotations
 import io
 import logging
 from pathlib import Path
-from typing import List
+from typing import Callable, List
 
 import torch
 
@@ -91,15 +91,41 @@ def _layer_index_from_key(key: str) -> int | None:
     return None
 
 
-def _split_state_dict_by_bert_layers(state_dict: dict, n_workers: int) -> List[dict]:
+def _layer_index_from_key_gpt2(key: str) -> int | None:
+    """Для ключа вида 'transformer.h.0.xxx' возвращает 0."""
+    prefix = "transformer.h."
+    if prefix in key:
+        rest = key.split(prefix, 1)[1]
+        num = rest.split(".", 1)[0]
+        if num.isdigit():
+            return int(num)
+    return None
+
+
+def _layer_index_from_key_llama(key: str) -> int | None:
+    """Для ключа вида 'model.layers.0.xxx' возвращает 0."""
+    prefix = "model.layers."
+    if prefix in key:
+        rest = key.split(prefix, 1)[1]
+        num = rest.split(".", 1)[0]
+        if num.isdigit():
+            return int(num)
+    return None
+
+
+def _split_state_dict_by_layers(
+    state_dict: dict,
+    n_workers: int,
+    layer_index_fn: Callable[[str], int | None],
+) -> List[dict]:
     """
-    Группирует ключи по encoder.layer.i, затем распределяет слои по n_workers шардам.
-    Каждый шард получает полные state_dict для своих слоёв (целые слои).
+    Группирует ключи по слоям (layer_index_fn извлекает индекс из ключа),
+    распределяет слои по n_workers шардам. Ключи без слоя игнорируются.
     """
     from collections import defaultdict
     by_layer: dict[int, dict] = defaultdict(dict)
     for k, v in state_dict.items():
-        idx = _layer_index_from_key(k)
+        idx = layer_index_fn(k)
         if idx is not None:
             by_layer[idx][k] = v
     if not by_layer:
@@ -113,6 +139,21 @@ def _split_state_dict_by_bert_layers(state_dict: dict, n_workers: int) -> List[d
     return shards
 
 
+def _split_state_dict_by_bert_layers(state_dict: dict, n_workers: int) -> List[dict]:
+    """Разбиение по encoder.layer.i (BERT)."""
+    return _split_state_dict_by_layers(state_dict, n_workers, _layer_index_from_key)
+
+
+def _split_state_dict_by_gpt2_layers(state_dict: dict, n_workers: int) -> List[dict]:
+    """Разбиение по transformer.h.i (GPT-2)."""
+    return _split_state_dict_by_layers(state_dict, n_workers, _layer_index_from_key_gpt2)
+
+
+def _split_state_dict_by_llama_layers(state_dict: dict, n_workers: int) -> List[dict]:
+    """Разбиение по model.layers.i (LLaMA)."""
+    return _split_state_dict_by_layers(state_dict, n_workers, _layer_index_from_key_llama)
+
+
 def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
     """
     Обеспечивает наличие модели в кэше HF, загружает state_dict,
@@ -122,18 +163,27 @@ def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
     if n_workers <= 0:
         raise ValueError("n_workers должно быть >= 1")
     state_dict = _state_dict_from_hf(hf_model_id)
-    # Для BERT-подобных разбиваем по слоям, иначе round-robin
-    if any("encoder.layer." in k or "bert.encoder.layer." in k for k in state_dict):
+    keys = list(state_dict.keys())
+    # Выбор разбиения по слоям по префиксам ключей (приоритет: GPT-2, LLaMA, BERT)
+    if any("transformer.h." in k for k in keys):
+        shard_dicts = _split_state_dict_by_gpt2_layers(state_dict, n_workers)
+        shard_type = "GPT-2 (transformer.h)"
+    elif any("model.layers." in k for k in keys):
+        shard_dicts = _split_state_dict_by_llama_layers(state_dict, n_workers)
+        shard_type = "LLaMA (model.layers)"
+    elif any("encoder.layer." in k or "bert.encoder.layer." in k for k in keys):
         shard_dicts = _split_state_dict_by_bert_layers(state_dict, n_workers)
-        if not shard_dicts:
-            shard_dicts = _split_state_dict(state_dict, n_workers)
-        else:
-            logger.info("Sharding by BERT layers for %s", hf_model_id)
-            while len(shard_dicts) < n_workers:
-                shard_dicts.append({})
-            shard_dicts = shard_dicts[:n_workers]
+        shard_type = "BERT (encoder.layer)"
     else:
+        shard_dicts = []
+        shard_type = None
+    if not shard_dicts:
         shard_dicts = _split_state_dict(state_dict, n_workers)
+    else:
+        logger.info("Sharding by %s for %s", shard_type or "layers", hf_model_id)
+        while len(shard_dicts) < n_workers:
+            shard_dicts.append({})
+        shard_dicts = shard_dicts[:n_workers]
     result: List[bytes] = []
     buf = io.BytesIO()
     for sd in shard_dicts:

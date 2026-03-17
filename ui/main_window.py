@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import os
 import sys
+import subprocess
 import threading
+from pathlib import Path
 from typing import Dict, List
 
 from PyQt6 import QtCore, QtWidgets
@@ -44,7 +46,8 @@ def _worker_list_to_dict(worker_list) -> Dict[str, dict]:
             "status": _STATUS_NAMES.get(w.status, "UNKNOWN"),
             "cpu_cores": w.resources.cpu_cores,
             "ram_total_mb": w.resources.ram_total_mb,
-            "gpus": [{"name": g.name} for g in w.resources.gpus],
+            "ram_available_mb": w.resources.ram_available_mb,
+            "gpus": [{"name": g.name, "total_vram_mb": getattr(g, "total_vram_mb", 0)} for g in w.resources.gpus],
         }
     return out
 
@@ -73,12 +76,14 @@ class MasterPoller(QtCore.QObject):
 
 class MainWindow(QtWidgets.QMainWindow):
     load_finished = QtCore.pyqtSignal(bool, str)
+    unload_finished = QtCore.pyqtSignal(bool, str)
     apply_workers_finished = QtCore.pyqtSignal(bool, str)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Cluster Master UI")
         self.load_finished.connect(self._on_load_finished)
+        self.unload_finished.connect(self._on_unload_finished)
         self.apply_workers_finished.connect(self._on_apply_workers_finished)
 
         settings = load_settings()
@@ -109,7 +114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ——— Вкладка «Настройки» ———
         settings_layout = QtWidgets.QVBoxLayout()
 
-        # Адрес мастера
+        # Адрес мастера и запуск мастера
         master_grp = QtWidgets.QGroupBox("Подключение к мастеру")
         master_layout = QtWidgets.QVBoxLayout()
         self._master_edit = QtWidgets.QLineEdit()
@@ -117,6 +122,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._master_edit.setText(self._addr)
         self._master_edit.textChanged.connect(self._schedule_save)
         master_layout.addWidget(self._master_edit)
+        start_master_btn = QtWidgets.QPushButton("Старт мастера")
+        start_master_btn.setToolTip("Запуск мастера в отдельном процессе (python -m scripts.run_master)")
+        start_master_btn.clicked.connect(self._on_start_master)
+        master_layout.addWidget(start_master_btn)
+        self._master_process: subprocess.Popen | None = None
         master_grp.setLayout(master_layout)
         settings_layout.addWidget(master_grp)
 
@@ -151,13 +161,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._model_edit.textChanged.connect(self._schedule_save)
         scan_btn = QtWidgets.QPushButton("Скан")
         start_btn = QtWidgets.QPushButton("Старт")
+        unload_btn = QtWidgets.QPushButton("Выгрузить модель")
         scan_btn.clicked.connect(self._on_scan)
         start_btn.clicked.connect(self._on_start)
+        unload_btn.clicked.connect(self._on_unload_model)
         model_layout.addWidget(QtWidgets.QLabel("Модель HuggingFace:"))
         model_layout.addWidget(self._model_edit)
         btn_layout = QtWidgets.QHBoxLayout()
         btn_layout.addWidget(scan_btn)
         btn_layout.addWidget(start_btn)
+        btn_layout.addWidget(unload_btn)
         btn_layout.addStretch()
         model_layout.addLayout(btn_layout)
         model_grp.setLayout(model_layout)
@@ -243,6 +256,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self._poller.set_master_addr(addr)
             self._addr_label.setText(f"Мастер: {addr} (обновление каждые {POLL_INTERVAL_MS // 1000} с)")
 
+    def _on_start_master(self) -> None:
+        """Запуск мастера в отдельном процессе (python -m scripts.run_master)."""
+        if self._master_process is not None and self._master_process.poll() is None:
+            self.statusBar().showMessage(f"Мастер уже запущен (PID {self._master_process.pid})")
+            return
+        project_root = Path(__file__).resolve().parent.parent
+        try:
+            self._master_process = subprocess.Popen(
+                [sys.executable, "-m", "scripts.run_master"],
+                cwd=project_root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.statusBar().showMessage(f"Мастер запущен (PID {self._master_process.pid})")
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка запуска мастера: {e}")
+            self._master_process = None
+
     def _on_timer(self) -> None:
         threading.Thread(target=self._poller.poll, daemon=True).start()
 
@@ -319,6 +351,30 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.statusBar().showMessage(f"Ошибка: {error}")
 
+    def _on_unload_model(self) -> None:
+        self.statusBar().showMessage("Выгрузка модели с воркеров...")
+
+        def do_unload() -> None:
+            try:
+                channel = grpc.insecure_channel(self._addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                resp = stub.UnloadModel(
+                    cluster_pb2.UnloadModelRequest(model_id=""),
+                    timeout=30.0,
+                )
+                channel.close()
+                self.unload_finished.emit(resp.ok, resp.error or "")
+            except Exception as e:
+                self.unload_finished.emit(False, str(e))
+
+        threading.Thread(target=do_unload, daemon=True).start()
+
+    def _on_unload_finished(self, ok: bool, error: str) -> None:
+        if ok:
+            self.statusBar().showMessage("Модель выгружена с воркеров (VRAM освобождена)")
+        else:
+            self.statusBar().showMessage(f"Ошибка выгрузки: {error}")
+
     def _on_workers_updated(self, workers: Dict[str, dict]) -> None:
         self._table_model.update_workers(workers)
         self.statusBar().showMessage(f"Воркеров: {len(workers)}")
@@ -329,7 +385,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 class WorkerTableModel(QtCore.QAbstractTableModel):
-    HEADERS = ["ID", "Status", "CPU", "RAM (MB)", "GPUs"]
+    HEADERS = ["ID", "Status", "CPU", "RAM свободно / всего (MB)", "GPUs"]
 
     def __init__(self, workers: Dict[str, dict] | None = None) -> None:
         super().__init__()
@@ -361,9 +417,14 @@ class WorkerTableModel(QtCore.QAbstractTableModel):
         if col == 2:
             return str(w.get("cpu_cores", ""))
         if col == 3:
-            return str(w.get("ram_total_mb", ""))
+            avail = w.get("ram_available_mb")
+            total = w.get("ram_total_mb")
+            if avail is not None and total is not None:
+                return f"{avail} / {total}"
+            return str(total or avail or "")
         if col == 4:
-            return ", ".join(str(g.get("name")) for g in w.get("gpus", []))
+            gpus = w.get("gpus", [])
+            return ", ".join(str(g.get("name", "")) for g in gpus) if gpus else "—"
         return ""
 
     def headerData(self, section: int, orientation: QtCore.Qt.Orientation, role: int = QtCore.Qt.ItemDataRole.DisplayRole):

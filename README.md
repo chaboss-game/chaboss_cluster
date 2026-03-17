@@ -264,16 +264,16 @@ UI каждые 3 с опрашивает мастер (ListWorkers) и пока
 
 **Уже сделано:**
 - gRPC‑протокол master ↔ worker (GetStatus, InitShard, RunStage, HealthStream); в StageRequest передаются model_id и shard_id.
-- Воркеры: сбор ресурсов (CPU/RAM/GPU), приём шардов (inline_blob, shared_path, hf), сборка BERT‑слоёв из шарда (BertLayer), RunStage с реальным forward по модулю или identity.
-- Мастер: реестр воркеров, HealthStream + автопереподключение с backoff, загрузка модели с HF и рассылка шардов (LoadModel); для BERT‑подобных — разбиение по слоям (encoder.layer.i), иначе round‑robin; run_pipeline с передачей model_id/shard_id.
-- Admin API: ListWorkers, LoadModel.
+- Воркеры: сбор ресурсов (CPU/RAM/GPU), приём шардов (inline_blob, shared_path, hf), сборка слоёв из шарда: BERT (BertLayer), GPT‑2 (GPT2Block), LLaMA (LlamaDecoderLayer), Qwen2 (Qwen2DecoderLayer); RunStage с реальным forward по модулю или identity.
+- Мастер: реестр воркеров, HealthStream + автопереподключение с backoff, загрузка модели с HF и рассылка шардов (LoadModel); разбиение по слоям: BERT (encoder.layer), GPT‑2 (transformer.h), LLaMA/Qwen2 (model.layers), иначе round‑robin; run_pipeline с передачей model_id/shard_id.
+- Admin API: ListWorkers, LoadModel, UnloadModel; при LoadModel текущая модель сначала выгружается с воркеров.
 - OpenAI‑совместимый HTTP API на порту 8055: /v1/models, /v1/chat/completions, /v1/completions; при загруженной модели chat/completions: токенизатор (кэш по model_id) → эмбеддинги (BERT) → run_pipeline → ответ с учётом выхода энкодера; в usage возвращаются prompt_tokens.
-- PyQt6 UI: вкладки Воркеры/Настройки, конфиг воркеров (IP, port, key), модель HF, Скан/Старт, автосохранение настроек; кнопка **«Применить конфиг на мастере»** — отправка списка воркеров на мастер (UpdateWorkersConfig) без перезапуска.
+- PyQt6 UI: вкладки Воркеры/Настройки, конфиг воркеров (IP, port, key), модель HF, Скан/Старт, **Выгрузить модель** (UnloadModel), автосохранение настроек; кнопка «Применить конфиг на мастере» (UpdateWorkersConfig).
 
 **Осталось по плану:**
 
 1. **Расширение forward на воркерах**  
-   Реализован forward для BERT‑подобных (encoder.layer): на воркере собирается Sequential из BertLayer по state_dict шарда. Осталось: поддержка других архитектур (GPT‑2, LLaMA и т.д.), разбиение по слоям для них.
+   Реализовано разбиение по слоям и forward для BERT (encoder.layer), GPT‑2 (transformer.h), LLaMA и Qwen2 (model.layers): мастер шардирует по соответствующим ключам, на воркере собирается Sequential из BertLayer / GPT2Block / LlamaDecoderLayer / Qwen2DecoderLayer. Осталось: при необходимости — Mistral и другие архитектуры с model.layers.
 
 2. **Токенизация и декодирование в HTTP API**  
    Сделано: токенизатор и слой эмбеддингов (BERT) на мастере (кэш по model_id), input_ids → эмбеддинги → run_pipeline; в ответе — форма выхода энкодера, usage.prompt_tokens. Осталось: декодер до текста (для BERT нет генерации; для GPT‑стиля — LM head и decode).
@@ -285,7 +285,7 @@ UI каждые 3 с опрашивает мастер (ListWorkers) и пока
    Варианты: общий storage (NFS/SMB) для весов вместо inline_blob; прямые каналы воркер↔воркер; опционально torch.distributed.rpc / TensorPipe для быстрого обмена тензорами в локальной сети.
 
 5. **Управление шардами по требованию**  
-   Выгрузка/загрузка шардов по запросу (lazy load/unload), освобождение VRAM при простое, повторный cold start при смене модели.
+   Сделано: RPC UnloadShard на воркере (очистка _shards/_shard_modules, torch.cuda.empty_cache); мастер unload_model(model_id) рассылает UnloadShard по воркерам; при load_model сначала выгружается текущая модель; Admin UnloadModel + кнопка «Выгрузить модель» в UI. Осталось: опционально lazy load (загрузка шарда по первому запросу).
 
 6. ~~**Применение конфига воркеров из UI на мастере**~~ — сделано: RPC UpdateWorkersConfig, кнопка «Применить конфиг на мастере» в UI.
 

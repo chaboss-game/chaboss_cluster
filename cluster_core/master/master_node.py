@@ -24,6 +24,7 @@ logger = logging.getLogger("master.node")
 HEARTBEAT_INTERVAL_S = 2.0
 RECONNECT_BACKOFF_INITIAL_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
+GET_STATUS_TIMEOUT_S = 15.0  # таймаут GetStatus при подключении/переподключении (медленная сеть или загрузка воркера)
 
 
 def _parse_worker_id(key: str) -> WorkerId:
@@ -118,7 +119,7 @@ class MasterNode:
 
         worker_id_pb = cluster_pb2.WorkerId(host=w_cfg.host, port=w_cfg.port)
         try:
-            desc = stub.GetStatus(worker_id_pb, timeout=5.0)
+            desc = stub.GetStatus(worker_id_pb, timeout=GET_STATUS_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to get status from worker %s: %s", target, exc)
             channel.close()
@@ -145,7 +146,7 @@ class MasterNode:
         stub = cluster_pb2_grpc.WorkerServiceStub(channel)
         worker_id_pb = cluster_pb2.WorkerId(host=w_cfg.host, port=w_cfg.port)
         try:
-            desc = stub.GetStatus(worker_id_pb, timeout=5.0)
+            desc = stub.GetStatus(worker_id_pb, timeout=GET_STATUS_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reconnect GetStatus failed for %s: %s", target, exc)
             channel.close()
@@ -256,13 +257,47 @@ class MasterNode:
 
         return True, ""
 
+    def unload_model(self, model_id: str | None = None) -> tuple[bool, str]:
+        """
+        Выгружает шарды с воркеров (освобождение VRAM).
+        model_id: конкретная модель или None/"" — выгрузить текущую загруженную модель.
+        Возвращает (ok, error_message).
+        """
+        with self._lock:
+            worker_keys = list(self._stubs.keys())
+        if not worker_keys:
+            return True, ""
+        mid = (model_id or "").strip() or self._last_loaded_model_id
+        if not mid:
+            return True, ""
+        errors: list[str] = []
+        for i, key in enumerate(worker_keys):
+            stub = self._stubs.get(key)
+            if stub is None:
+                continue
+            req = cluster_pb2.UnloadShardRequest(model_id=mid, shard_id=str(i))
+            try:
+                resp = stub.UnloadShard(req, timeout=30.0)
+                if not resp.ok:
+                    errors.append(f"{key}: {resp.error}")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{key}: {e}")
+        if mid == self._last_loaded_model_id:
+            self._last_loaded_model_id = None
+        if errors:
+            return False, "; ".join(errors)
+        return True, ""
+
     def load_model(self, hf_model_id: str) -> tuple[bool, str]:
         """
         Загружает модель с HF (если нет в кэше — скачивает), дробит на чанки
         и рассылает воркерам через InitShard (холодная загрузка).
+        Перед загрузкой выгружает текущую модель с воркеров (освобождение VRAM).
         Возвращает (ok, error_message).
         """
         from cluster_core.master.model_loader import prepare_shards
+
+        self.unload_model(None)
 
         with self._lock:
             worker_keys = list(self._stubs.keys())
