@@ -347,6 +347,34 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(worker_tab, "Воркер")
 
         self.setCentralWidget(tabs)
+
+        # Панель визуального прогресса загрузки модели (мастер / воркеры)
+        self._load_stage_label = QtWidgets.QLabel("Ожидание запуска загрузки модели")
+        self._load_progress_master = QtWidgets.QProgressBar()
+        self._load_progress_workers = QtWidgets.QProgressBar()
+        for bar in (self._load_progress_master, self._load_progress_workers):
+            bar.setMinimum(0)
+            bar.setMaximum(1)
+            bar.setValue(0)
+        self._load_progress_master.setFormat("Мастер: подготовка / загрузка")
+        self._load_progress_workers.setFormat("Воркеры: загрузка шардов")
+        load_prog_widget = QtWidgets.QWidget()
+        lp_layout = QtWidgets.QVBoxLayout()
+        lp_layout.setContentsMargins(6, 6, 6, 6)
+        lp_layout.addWidget(QtWidgets.QLabel("Прогресс загрузки модели (HF → мастер → воркеры):"))
+        lp_layout.addWidget(self._load_stage_label)
+        lp_layout.addWidget(self._load_progress_master)
+        lp_layout.addWidget(self._load_progress_workers)
+        lp_layout.addStretch()
+        load_prog_widget.setLayout(lp_layout)
+        self._load_progress_dock = QtWidgets.QDockWidget("Прогресс модели", self)
+        self._load_progress_dock.setWidget(load_prog_widget)
+        self._load_progress_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self._load_progress_dock)
+        self._load_progress_dock.hide()
         self.statusBar().showMessage("Загрузка...")
 
         self._poller.workers_updated.connect(self._on_workers_updated)
@@ -725,12 +753,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if not model_id:
             self.statusBar().showMessage("Введите название модели HuggingFace")
             return
-        self.append_log("Загрузка модели %s (режим: %s, ресурсы: %s%%)..." % (
-            model_id,
-            self._mode_combo.currentData() or "fit_in_cluster",
-            self._resource_percent_spin.value(),
-        ))
+        mode_val = self._mode_combo.currentData() or "fit_in_cluster"
+        res_pct = self._resource_percent_spin.value()
+        self.append_log(
+            "Загрузка модели %s (режим: %s, ресурсы: %s%%)..."
+            % (model_id, mode_val, res_pct)
+        )
         self.statusBar().showMessage(f"Загрузка модели {model_id}...")
+
+        # Визуальный прогресс: этап 1 — подготовка мастера (HF, план шардов)
+        self._load_progress_dock.show()
+        self._load_stage_label.setText("Этап 1/2: мастер подготавливает модель (HF → кэш, разметка шардов)")
+        # Индикация «в процессе» — оставляем 0/1, а значение поднимем по завершении этапа.
+        self._load_progress_master.setValue(0)
+        self._load_progress_workers.setValue(0)
+
         self._model_edit.setEnabled(False)
 
         def do_load():
@@ -771,9 +808,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_load_finished(self, ok: bool, error: str) -> None:
         self._model_edit.setEnabled(True)
         if ok:
+            # Этапы 1/2 и 2/2 завершены успешно.
+            self._load_progress_master.setValue(1)
+            self._load_progress_workers.setValue(1)
+            self._load_stage_label.setText("Модель успешно загружена: мастер и воркеры готовы")
             self.append_log("Модель загружена и разослана воркерам")
             self.statusBar().showMessage("Модель загружена и разослана воркерам")
         else:
+            # Ошибка: фиксируем в прогрессе и не скрываем панель, чтобы пользователь видел состояние.
+            self._load_progress_master.setValue(0)
+            self._load_progress_workers.setValue(0)
+            self._load_stage_label.setText("Ошибка при загрузке модели — см. сообщение ниже и логи мастера/воркеров")
             self.append_log("Ошибка загрузки модели: " + error)
             self.statusBar().showMessage(f"Ошибка: {error}")
             self._show_load_error_dialog(error)

@@ -404,20 +404,77 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 logger.info("Ответ мастеру: шард из shared_path загружен, ключей=%d, время=%.2f с", len(state_dict), elapsed)
             elif request.weight_source == "hf" and request.hf_model_name:
                 logger.info("Получена команда скачать модель с HF: %s", request.hf_model_name)
-                from huggingface_hub import hf_hub_download
-                logger.info("Начало скачивания с HuggingFace...")
-                path = hf_hub_download(repo_id=request.hf_model_name, filename="pytorch_model.bin")
-                logger.info("Скачивание с HF завершено: %s", path)
-                state_dict = torch.load(path, map_location="cpu", weights_only=True)
-                if not isinstance(state_dict, dict):
-                    state_dict = getattr(state_dict, "state_dict", lambda: {})()
-                logger.info("state_dict загружен с диска, ключей=%d", len(state_dict))
+                logger.info("Начало скачивания с HuggingFace (bin/safetensors/msgpack)...")
+                try:
+                    from huggingface_hub import snapshot_download
+                except ImportError:
+                    return cluster_pb2.InitShardResponse(
+                        ok=False,
+                        error="На воркере не установлен huggingface_hub (pip install huggingface_hub)",
+                    )
+
+                cache_dir = snapshot_download(
+                    repo_id=request.hf_model_name,
+                    allow_patterns=["*.bin", "*.safetensors", "*.msgpack"],
+                )
+                path = Path(cache_dir)
+                logger.info("Артефакты модели скачаны в кэш: %s", path)
+
+                # Логика аналогична мастеру: пробуем pytorch_model.bin / model.safetensors / набор *.safetensors / *.bin
+                state_dict = None
+                if (path / "pytorch_model.bin").exists():
+                    logger.info("Найден pytorch_model.bin, загружаем...")
+                    state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
+                    if not isinstance(state_dict, dict):
+                        state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
+                elif (path / "model.safetensors").exists():
+                    logger.info("Найден единый model.safetensors, загружаем...")
+                    try:
+                        from safetensors.torch import load_file
+                    except ImportError:
+                        return cluster_pb2.InitShardResponse(
+                            ok=False,
+                            error="На воркере не установлен safetensors (pip install safetensors)",
+                        )
+                    state_dict = load_file(str(path / "model.safetensors"))
+                else:
+                    st_files = list(path.glob("*.safetensors"))
+                    if st_files:
+                        logger.info("Найдено %d *.safetensors, загружаем по очереди...", len(st_files))
+                        try:
+                            from safetensors.torch import load_file
+                        except ImportError:
+                            return cluster_pb2.InitShardResponse(
+                                ok=False,
+                                error="На воркере не установлен safetensors (pip install safetensors)",
+                            )
+                        state_dict = {}
+                        for f in st_files:
+                            state_dict.update(load_file(str(f)))
+                    else:
+                        bin_files = list(path.glob("*.bin"))
+                        if bin_files:
+                            logger.info("Найден %d *.bin, загружаем первый: %s", len(bin_files), bin_files[0])
+                            state_dict = torch.load(bin_files[0], map_location="cpu", weights_only=True)
+                            if not isinstance(state_dict, dict):
+                                state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
+
+                if state_dict is None:
+                    return cluster_pb2.InitShardResponse(
+                        ok=False,
+                        error=(
+                            "Не удалось найти веса модели в репозитории HF "
+                            f"({request.hf_model_name}): нет *.bin/*.safetensors/*.msgpack"
+                        ),
+                    )
+
+                logger.info("state_dict загружен из кэша HF, ключей=%d", len(state_dict))
 
                 # Если мастер прислал список ключей шарда — оставляем только их.
                 shard_keys = list(request.shard_keys) if request.shard_keys else []
                 if shard_keys:
                     logger.info("Получены метки шарда (keys=%d). Фильтрация state_dict...", len(shard_keys))
-                    filtered = {k: state_dict[k] for k in shard_keys if k in state_dict}
+                    filtered = {k: state_dict.get(k) for k in shard_keys if k in state_dict}
                     missing = len(shard_keys) - len(filtered)
                     state_dict = filtered
                     logger.info("Фильтрация завершена: keys=%d (missing=%d)", len(state_dict), missing)
