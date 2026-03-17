@@ -96,8 +96,6 @@ class MasterNode:
         self._desired_worker_configs: Dict[str, WorkerConfig] = {}  # key -> WorkerConfig, обновляется из UI
         self._stop_event = threading.Event()
         self._last_loaded_model_id: str | None = None
-        # Время последнего успешного health‑пинга по воркеру (для фильтрации кратковременных флапов).
-        self._last_health_ok_ts: Dict[str, float] = {}
 
     def start_background(self) -> None:
         """Старт: первичное подключение к воркерам и поток HealthStream для каждого из конфига."""
@@ -252,18 +250,15 @@ class MasterNode:
                     )
 
             try:
-                # Важно: это долгоживущий поток; дедлайн/timeout тут НЕ должен быть коротким,
-                # иначе мы гарантированно получим periodic DEADLINE_EXCEEDED и флаппинг статуса.
+                # Долгоживущий поток; дедлайн не ставим — иначе флаппинг статуса.
                 self._registry.set_status(wid, WorkerStatus.ONLINE)
-                # Фиксируем время, когда воркер был в стабильном ONLINE.
-                self._last_health_ok_ts[worker_key] = time.time()
                 for _ in stub.HealthStream(ping_iterator()):
-                    # Не дёргаем статус на каждый pong — он меняется только при переходах.
-                    # Сам факт живого стрима считаем подтверждением ONLINE.
-                    self._last_health_ok_ts[worker_key] = time.time()
                     pass
             except grpc.RpcError as e:
-                logger.warning("HealthStream RpcError for %s: %s", worker_key, e)
+                logger.warning(
+                    "HealthStream обрыв (мастер) %s: code=%s details=%s",
+                    worker_key, e.code(), e.details() or "",
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning("HealthStream failed for %s: %s", worker_key, e)
 
@@ -275,13 +270,8 @@ class MasterNode:
                         ch.close()
                     except Exception:  # noqa: S110
                         pass
-            # Если HealthStream отвалился, но до этого воркер успешно отвечал менее GRACE_S назад,
-            # считаем это кратковременным сбоем сети и не флапаем статус.
-            grace_s = 20.0
-            last_ok = self._last_health_ok_ts.get(worker_key, 0.0)
-            now = time.time()
-            if now - last_ok >= grace_s or last_ok == 0.0:
-                self._registry.set_status(wid, WorkerStatus.RECONNECTING)
+            # RECONNECTING показываем только когда не удаётся переподключиться (см. stub is None).
+            # При обрыве стрима просто переподключаемся без смены статуса — без флаппинга в UI.
             time.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, RECONNECT_BACKOFF_MAX_S)
 

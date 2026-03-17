@@ -32,12 +32,16 @@ def main() -> None:
     port = int(cfg.get("listen_port", 50052))
     auth_token = cfg.get("auth_token") or None
 
-    # Keepalive: разрешаем пинги без активных RPC, чтобы долгоживущий HealthStream не обрывался.
+    # Долгоживущие соединения: не закрывать по возрасту/простою (INT_MAX = без лимита).
+    # Иначе сервер gRPC по умолчанию может закрывать соединение через несколько минут.
+    GRPC_UNLIMITED_MS = 2147483647
     server_options = [
         ("grpc.keepalive_time_ms", 15_000),
         ("grpc.keepalive_timeout_ms", 5_000),
         ("grpc.keepalive_permit_without_calls", 1),
         ("grpc.http2.max_pings_without_data", 0),
+        ("grpc.max_connection_idle_ms", GRPC_UNLIMITED_MS),
+        ("grpc.max_connection_age_ms", GRPC_UNLIMITED_MS),
     ]
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=8),

@@ -524,12 +524,15 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         request_iterator: Iterator[cluster_pb2.HealthPing],
         context: grpc.ServicerContext,
     ) -> Iterator[cluster_pb2.HealthPong]:
-        for ping in request_iterator:
-            yield cluster_pb2.HealthPong(
-                id=self._to_worker_id(),
-                nonce=ping.nonce,
-                status=cluster_pb2.WORKER_STATUS_ONLINE,
-            )
+        try:
+            for ping in request_iterator:
+                yield cluster_pb2.HealthPong(
+                    id=self._to_worker_id(),
+                    nonce=ping.nonce,
+                    status=cluster_pb2.WORKER_STATUS_ONLINE,
+                )
+        except Exception as e:
+            logger.warning("HealthStream обрыв (воркер): %s", e)
 
     def RunStage(
         self,
