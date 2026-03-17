@@ -3,6 +3,7 @@ grpcio-tools==1.68.0
 torch
 transformers
 huggingface_hub
+httpx
 safetensors
 PyYAML
 psutil

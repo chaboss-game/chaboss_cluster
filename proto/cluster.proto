@@ -121,8 +121,13 @@ message StageResponse {
 
 // Worker-side service, called by master.
 
+message GetLoadProgressResponse {
+  LoadProgress progress = 1;
+}
+
 service WorkerService {
   rpc GetStatus(WorkerId) returns (WorkerDescriptor);
+  rpc GetLoadProgress(WorkerId) returns (GetLoadProgressResponse);
   rpc InitShard(InitShardRequest) returns (InitShardResponse);
   rpc UnloadShard(UnloadShardRequest) returns (UnloadShardResponse);
   rpc RunStage(stream StageRequest) returns (stream StageResponse);
@@ -144,6 +149,24 @@ message LoadModelRequest {
 message LoadModelResponse {
   bool ok = 1;
   string error = 2;
+}
+
+// Прогресс загрузки (мастер или воркер)
+message LoadProgress {
+  string stage = 1;           // "download" | "sharding" | "worker_N" | "done"
+  int32 percent = 2;          // 0-100
+  int64 bytes_downloaded = 3;
+  int64 bytes_total = 4;
+  string current_file = 5;
+}
+
+// Событие потока прогресса загрузки модели
+message LoadModelProgressEvent {
+  LoadProgress master = 1;
+  map<string, LoadProgress> workers = 2;  // key = "host:port"
+  bool done = 3;                           // последнее сообщение
+  bool ok = 4;
+  string error = 5;
 }
 
 message WorkerEndpoint {
@@ -173,6 +196,7 @@ message UnloadModelResponse {
 service MasterAdminService {
   rpc ListWorkers(Empty) returns (WorkerList);
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc LoadModelStream(LoadModelRequest) returns (stream LoadModelProgressEvent);
   rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
   rpc UpdateWorkersConfig(UpdateWorkersConfigRequest) returns (UpdateWorkersConfigResponse);
 }

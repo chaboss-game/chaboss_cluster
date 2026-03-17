@@ -26,9 +26,7 @@ if _version_not_supported:
 
 
 class WorkerServiceStub(object):
-    """Worker-side service, called by master.
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -40,6 +38,11 @@ class WorkerServiceStub(object):
                 '/cluster.WorkerService/GetStatus',
                 request_serializer=cluster__pb2.WorkerId.SerializeToString,
                 response_deserializer=cluster__pb2.WorkerDescriptor.FromString,
+                _registered_method=True)
+        self.GetLoadProgress = channel.unary_unary(
+                '/cluster.WorkerService/GetLoadProgress',
+                request_serializer=cluster__pb2.WorkerId.SerializeToString,
+                response_deserializer=cluster__pb2.GetLoadProgressResponse.FromString,
                 _registered_method=True)
         self.InitShard = channel.unary_unary(
                 '/cluster.WorkerService/InitShard',
@@ -64,11 +67,15 @@ class WorkerServiceStub(object):
 
 
 class WorkerServiceServicer(object):
-    """Worker-side service, called by master.
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def GetStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLoadProgress(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -106,6 +113,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     request_deserializer=cluster__pb2.WorkerId.FromString,
                     response_serializer=cluster__pb2.WorkerDescriptor.SerializeToString,
             ),
+            'GetLoadProgress': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLoadProgress,
+                    request_deserializer=cluster__pb2.WorkerId.FromString,
+                    response_serializer=cluster__pb2.GetLoadProgressResponse.SerializeToString,
+            ),
             'InitShard': grpc.unary_unary_rpc_method_handler(
                     servicer.InitShard,
                     request_deserializer=cluster__pb2.InitShardRequest.FromString,
@@ -135,9 +147,7 @@ def add_WorkerServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class WorkerService(object):
-    """Worker-side service, called by master.
-
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
     def GetStatus(request,
@@ -156,6 +166,33 @@ class WorkerService(object):
             '/cluster.WorkerService/GetStatus',
             cluster__pb2.WorkerId.SerializeToString,
             cluster__pb2.WorkerDescriptor.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLoadProgress(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.WorkerService/GetLoadProgress',
+            cluster__pb2.WorkerId.SerializeToString,
+            cluster__pb2.GetLoadProgressResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -294,6 +331,11 @@ class MasterAdminServiceStub(object):
                 request_serializer=cluster__pb2.LoadModelRequest.SerializeToString,
                 response_deserializer=cluster__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
+        self.LoadModelStream = channel.unary_stream(
+                '/cluster.MasterAdminService/LoadModelStream',
+                request_serializer=cluster__pb2.LoadModelRequest.SerializeToString,
+                response_deserializer=cluster__pb2.LoadModelProgressEvent.FromString,
+                _registered_method=True)
         self.UnloadModel = channel.unary_unary(
                 '/cluster.MasterAdminService/UnloadModel',
                 request_serializer=cluster__pb2.UnloadModelRequest.SerializeToString,
@@ -316,6 +358,12 @@ class MasterAdminServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def LoadModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LoadModelStream(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -345,6 +393,11 @@ def add_MasterAdminServiceServicer_to_server(servicer, server):
                     servicer.LoadModel,
                     request_deserializer=cluster__pb2.LoadModelRequest.FromString,
                     response_serializer=cluster__pb2.LoadModelResponse.SerializeToString,
+            ),
+            'LoadModelStream': grpc.unary_stream_rpc_method_handler(
+                    servicer.LoadModelStream,
+                    request_deserializer=cluster__pb2.LoadModelRequest.FromString,
+                    response_serializer=cluster__pb2.LoadModelProgressEvent.SerializeToString,
             ),
             'UnloadModel': grpc.unary_unary_rpc_method_handler(
                     servicer.UnloadModel,
@@ -411,6 +464,33 @@ class MasterAdminService(object):
             '/cluster.MasterAdminService/LoadModel',
             cluster__pb2.LoadModelRequest.SerializeToString,
             cluster__pb2.LoadModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LoadModelStream(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cluster.MasterAdminService/LoadModelStream',
+            cluster__pb2.LoadModelRequest.SerializeToString,
+            cluster__pb2.LoadModelProgressEvent.FromString,
             options,
             channel_credentials,
             insecure,

@@ -7,7 +7,9 @@ import subprocess
 import platform
 import hashlib
 import psutil
+import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
 import grpc
@@ -300,6 +302,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         self._resources = _detect_resources()
         self._shards: Dict[str, Dict[str, Any]] = {}  # shard_id -> state_dict chunk
         self._shard_modules: Dict[str, nn.Module] = {}  # shard_id -> nn.Module (BERT layers и т.д.)
+        self._load_progress_lock = threading.Lock()
+        self._load_progress: Dict[str, Any] | None = None  # во время InitShard (HF): stage, percent, bytes_*
 
     # Helpers to convert internal dataclasses -> protobuf messages.
 
@@ -343,6 +347,25 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             resources=self._to_resource_info(),
             token_fingerprint=self._auth_token_fingerprint,
             token_status="UNKNOWN",
+        )
+
+    def GetLoadProgress(
+        self,
+        request: cluster_pb2.WorkerId,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.GetLoadProgressResponse:
+        with self._load_progress_lock:
+            p = self._load_progress
+        if not p:
+            return cluster_pb2.GetLoadProgressResponse(progress=cluster_pb2.LoadProgress(stage="", percent=0))
+        return cluster_pb2.GetLoadProgressResponse(
+            progress=cluster_pb2.LoadProgress(
+                stage=p.get("stage", "download"),
+                percent=int(p.get("percent", 0)),
+                bytes_downloaded=int(p.get("bytes_downloaded", 0)),
+                bytes_total=int(p.get("bytes_total", 0)),
+                current_file=p.get("current_file", "") or "",
+            )
         )
 
     def InitShard(
@@ -404,69 +427,34 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 logger.info("Ответ мастеру: шард из shared_path загружен, ключей=%d, время=%.2f с", len(state_dict), elapsed)
             elif request.weight_source == "hf" and request.hf_model_name:
                 logger.info("Получена команда скачать модель с HF: %s", request.hf_model_name)
-                logger.info("Начало скачивания с HuggingFace (bin/safetensors/msgpack)...")
                 try:
-                    from huggingface_hub import snapshot_download
-                except ImportError:
-                    return cluster_pb2.InitShardResponse(
-                        ok=False,
-                        error="На воркере не установлен huggingface_hub (pip install huggingface_hub)",
+                    from cluster_core.common.hf_download import download_repo_with_progress, load_state_dict_from_dir
+                except ImportError as e:
+                    return cluster_pb2.InitShardResponse(ok=False, error=f"hf_download недоступен: {e}")
+
+                def on_progress(percent: float, bytes_done: int, bytes_total: int, current_file: str) -> None:
+                    with self._load_progress_lock:
+                        self._load_progress = {
+                            "stage": "download",
+                            "percent": min(100, int(percent)),
+                            "bytes_downloaded": bytes_done,
+                            "bytes_total": bytes_total,
+                            "current_file": current_file,
+                        }
+
+                try:
+                    with self._load_progress_lock:
+                        self._load_progress = {"stage": "download", "percent": 0, "bytes_downloaded": 0, "bytes_total": 0, "current_file": ""}
+                    logger.info("Начало скачивания с HuggingFace (с прогрессом)...")
+                    path = download_repo_with_progress(
+                        request.hf_model_name,
+                        progress_callback=on_progress,
                     )
-
-                cache_dir = snapshot_download(
-                    repo_id=request.hf_model_name,
-                    allow_patterns=["*.bin", "*.safetensors", "*.msgpack"],
-                )
-                path = Path(cache_dir)
-                logger.info("Артефакты модели скачаны в кэш: %s", path)
-
-                # Логика аналогична мастеру: пробуем pytorch_model.bin / model.safetensors / набор *.safetensors / *.bin
-                state_dict = None
-                if (path / "pytorch_model.bin").exists():
-                    logger.info("Найден pytorch_model.bin, загружаем...")
-                    state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
-                    if not isinstance(state_dict, dict):
-                        state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
-                elif (path / "model.safetensors").exists():
-                    logger.info("Найден единый model.safetensors, загружаем...")
-                    try:
-                        from safetensors.torch import load_file
-                    except ImportError:
-                        return cluster_pb2.InitShardResponse(
-                            ok=False,
-                            error="На воркере не установлен safetensors (pip install safetensors)",
-                        )
-                    state_dict = load_file(str(path / "model.safetensors"))
-                else:
-                    st_files = list(path.glob("*.safetensors"))
-                    if st_files:
-                        logger.info("Найдено %d *.safetensors, загружаем по очереди...", len(st_files))
-                        try:
-                            from safetensors.torch import load_file
-                        except ImportError:
-                            return cluster_pb2.InitShardResponse(
-                                ok=False,
-                                error="На воркере не установлен safetensors (pip install safetensors)",
-                            )
-                        state_dict = {}
-                        for f in st_files:
-                            state_dict.update(load_file(str(f)))
-                    else:
-                        bin_files = list(path.glob("*.bin"))
-                        if bin_files:
-                            logger.info("Найден %d *.bin, загружаем первый: %s", len(bin_files), bin_files[0])
-                            state_dict = torch.load(bin_files[0], map_location="cpu", weights_only=True)
-                            if not isinstance(state_dict, dict):
-                                state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
-
-                if state_dict is None:
-                    return cluster_pb2.InitShardResponse(
-                        ok=False,
-                        error=(
-                            "Не удалось найти веса модели в репозитории HF "
-                            f"({request.hf_model_name}): нет *.bin/*.safetensors/*.msgpack"
-                        ),
-                    )
+                    logger.info("Артефакты модели скачаны в кэш: %s", path)
+                    state_dict = load_state_dict_from_dir(path, request.hf_model_name)
+                finally:
+                    with self._load_progress_lock:
+                        self._load_progress = None
 
                 logger.info("state_dict загружен из кэша HF, ключей=%d", len(state_dict))
 

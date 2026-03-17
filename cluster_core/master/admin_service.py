@@ -1,9 +1,10 @@
 """
-Admin gRPC-сервис мастера для UI и внешних инструментов (ListWorkers, LoadModel).
+Admin gRPC-сервис мастера для UI и внешних инструментов (ListWorkers, LoadModel, LoadModelStream).
 """
 from __future__ import annotations
 
-from __future__ import annotations
+import queue
+import threading
 
 import grpc
 
@@ -79,6 +80,33 @@ class MasterAdminService(cluster_pb2_grpc.MasterAdminServiceServicer):
             return cluster_pb2.LoadModelResponse(ok=False, error="Мастер не готов к загрузке модели")
         ok, err = self._master_node.load_model(request.hf_model_id.strip())
         return cluster_pb2.LoadModelResponse(ok=ok, error=err or "")
+
+    def LoadModelStream(
+        self,
+        request: cluster_pb2.LoadModelRequest,
+        context: grpc.ServicerContext,
+    ):
+        if not request.hf_model_id or not request.hf_model_id.strip():
+            yield cluster_pb2.LoadModelProgressEvent(done=True, ok=False, error="Укажите hf_model_id")
+            return
+        if self._master_node is None:
+            yield cluster_pb2.LoadModelProgressEvent(done=True, ok=False, error="Мастер не готов к загрузке модели")
+            return
+        progress_queue: queue.Queue[cluster_pb2.LoadModelProgressEvent] = queue.Queue()
+        def run() -> None:
+            self._master_node.load_model_with_progress(request.hf_model_id.strip(), progress_queue)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        while True:
+            try:
+                ev = progress_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not thread.is_alive():
+                    break
+                continue
+            yield ev
+            if ev.done:
+                break
 
     def UnloadModel(
         self,

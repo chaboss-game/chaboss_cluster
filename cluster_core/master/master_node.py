@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 import uuid
@@ -26,6 +27,7 @@ HEARTBEAT_INTERVAL_S = 2.0
 RECONNECT_BACKOFF_INITIAL_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
 GET_STATUS_TIMEOUT_S = 15.0  # таймаут GetStatus при подключении/переподключении (медленная сеть или загрузка воркера)
+INIT_SHARD_TIMEOUT_S = 900.0  # таймаут InitShard на воркере: скачивание с HF + загрузка шарда для больших моделей (до 15 мин)
 
 
 def _parse_worker_id(key: str) -> WorkerId:
@@ -395,7 +397,7 @@ class MasterNode:
                 shard_keys=shard_keys,
             )
             try:
-                resp = stub.InitShard(req, timeout=120.0)
+                resp = stub.InitShard(req, timeout=INIT_SHARD_TIMEOUT_S)
                 if not resp.ok:
                     logger.warning("Воркер %s: ошибка загрузки шарда: %s", key, resp.error)
                     errors.append(f"{key}: {resp.error}")
@@ -409,6 +411,103 @@ class MasterNode:
             return False, "; ".join(errors)
         self._last_loaded_model_id = hf_model_id
         return True, ""
+
+    def load_model_with_progress(
+        self,
+        hf_model_id: str,
+        progress_queue: "queue.Queue[cluster_pb2.LoadModelProgressEvent]",
+    ) -> None:
+        """
+        То же, что load_model, но кладёт в progress_queue события LoadModelProgressEvent
+        (прогресс мастера и воркеров). В конце кладёт событие с done=True, ok=..., error=...
+        """
+        from cluster_core.master.model_loader import prepare_shard_keys
+
+        def make_master_progress(stage: str, percent: int, bytes_done: int = 0, bytes_total: int = 0, current_file: str = "") -> cluster_pb2.LoadProgress:
+            return cluster_pb2.LoadProgress(
+                stage=stage,
+                percent=percent,
+                bytes_downloaded=bytes_done,
+                bytes_total=bytes_total,
+                current_file=current_file or "",
+            )
+
+        def make_event(master: cluster_pb2.LoadProgress | None, workers: Dict[str, cluster_pb2.LoadProgress], done: bool = False, ok: bool = False, error: str = "") -> cluster_pb2.LoadModelProgressEvent:
+            ev = cluster_pb2.LoadModelProgressEvent(done=done, ok=ok, error=error or "")
+            if master is not None:
+                ev.master.CopyFrom(master)
+            for k, v in workers.items():
+                ev.workers[k].CopyFrom(v)
+            return ev
+
+        try:
+            self.unload_model(None)
+            with self._lock:
+                worker_keys = list(self._stubs.keys())
+                stubs_snapshot = dict(self._stubs)
+            if not worker_keys:
+                progress_queue.put(make_event(None, {}, done=True, ok=False, error="Нет подключённых воркеров"))
+                return
+            bad = [k for k, wd in self._registry.all().items() if (wd.token_status or "") == "MISMATCH"]
+            if bad:
+                progress_queue.put(make_event(None, {}, done=True, ok=False, error="Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))))
+                return
+
+            def on_master_progress(percent: float, bytes_done: int, bytes_total: int, current_file: str) -> None:
+                progress_queue.put(make_event(
+                    make_master_progress("download", min(100, int(percent)), bytes_done, bytes_total, current_file),
+                    {},
+                ))
+
+            shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
+            progress_queue.put(make_event(make_master_progress("sharding", 100), {}))
+
+            errors: list[str] = []
+            workers_progress: Dict[str, cluster_pb2.LoadProgress] = {}
+            for i, key in enumerate(worker_keys):
+                stub = stubs_snapshot.get(key)
+                if stub is None:
+                    errors.append(f"{key}: нет соединения")
+                    continue
+                shard_keys = shard_keys_list[i] if i < len(shard_keys_list) else []
+                wid = _parse_worker_id(key)
+                req = cluster_pb2.InitShardRequest(
+                    spec=cluster_pb2.ShardSpec(model_id=hf_model_id, shard_id=str(i), backend="baseline"),
+                    weight_source="hf",
+                    hf_model_name=hf_model_id,
+                    shard_keys=shard_keys,
+                )
+                result: list = [None]
+                def do_init() -> None:
+                    result[0] = stub.InitShard(req, timeout=INIT_SHARD_TIMEOUT_S)
+                t = threading.Thread(target=do_init)
+                t.start()
+                worker_id_pb = cluster_pb2.WorkerId(host=wid.host, port=wid.port)
+                while t.is_alive():
+                    time.sleep(0.25)
+                    try:
+                        r = stub.GetLoadProgress(worker_id_pb, timeout=2.0)
+                        if r.progress and (r.progress.percent > 0 or r.progress.bytes_downloaded > 0):
+                            workers_progress[key] = r.progress
+                            progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
+                    except Exception:  # noqa: S110
+                        pass
+                t.join()
+                if result[0] and not result[0].ok:
+                    errors.append(f"{key}: {result[0].error}")
+                elif result[0] is None:
+                    errors.append(f"{key}: нет ответа")
+                workers_progress[key] = cluster_pb2.LoadProgress(stage="done", percent=100)
+                progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
+
+            if errors:
+                progress_queue.put(make_event(None, {}, done=True, ok=False, error="; ".join(errors)))
+                return
+            self._last_loaded_model_id = hf_model_id
+            progress_queue.put(make_event(None, {}, done=True, ok=True, error=""))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("load_model_with_progress failed: %s", e)
+            progress_queue.put(make_event(None, {}, done=True, ok=False, error=str(e)))
 
     def get_last_loaded_model_id(self) -> str | None:
         return self._last_loaded_model_id

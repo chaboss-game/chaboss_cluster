@@ -1,6 +1,7 @@
 """
 Загрузка модели с HuggingFace: проверка кэша, при необходимости скачивание,
 разбиение state_dict на чанки для воркеров (холодная загрузка).
+Поддержка побайтового прогресса через cluster_core.common.hf_download.
 """
 from __future__ import annotations
 
@@ -14,60 +15,28 @@ import torch
 logger = logging.getLogger("master.model_loader")
 
 
-def _state_dict_from_hf(model_id: str) -> dict:
-    """Загружает state_dict модели из кэша HF или скачивает. Возвращает state_dict."""
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        raise RuntimeError("Установите huggingface_hub: pip install huggingface_hub")
-
-    logger.info("Начало загрузки модели с HuggingFace: %s", model_id)
-    cache_dir = snapshot_download(repo_id=model_id, allow_patterns=["*.bin", "*.safetensors", "*.msgpack"])
-    path = Path(cache_dir)
-    logger.info("Модель загружена в локальное хранилище HF: %s", path)
-
-    # Пробуем pytorch_model.bin или model.safetensors
-    state_dict = None
-    if (path / "pytorch_model.bin").exists():
-        state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
-        if not isinstance(state_dict, dict):
-            state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
-    elif (path / "model.safetensors").exists():
+def _state_dict_from_hf(
+    model_id: str,
+    progress_callback: Callable[[float, int, int, str], None] | None = None,
+) -> dict:
+    """Загружает state_dict модели из кэша HF или скачивает. progress_callback(percent, bytes_done, bytes_total, current_file)."""
+    from cluster_core.common.hf_download import load_state_dict_from_dir
+    if progress_callback is not None:
+        from cluster_core.common.hf_download import download_repo_with_progress
+        logger.info("Начало загрузки модели с HuggingFace (с прогрессом): %s", model_id)
+        path = download_repo_with_progress(model_id, progress_callback=progress_callback)
+        logger.info("Модель скачана в: %s", path)
+    else:
         try:
-            from safetensors.torch import load_file
-            state_dict = load_file(str(path / "model.safetensors"))
+            from huggingface_hub import snapshot_download
         except ImportError:
-            raise RuntimeError("Для .safetensors установите safetensors: pip install safetensors")
+            raise RuntimeError("Установите huggingface_hub: pip install huggingface_hub")
+        logger.info("Начало загрузки модели с HuggingFace: %s", model_id)
+        cache_dir = snapshot_download(repo_id=model_id, allow_patterns=["*.bin", "*.safetensors", "*.msgpack"])
+        path = Path(cache_dir)
+        logger.info("Модель загружена в локальное хранилище HF: %s", path)
 
-    if state_dict is None:
-        # Один большой .safetensors или несколько файлов
-        st_files = list(path.glob("*.safetensors"))
-        if st_files:
-            try:
-                from safetensors.torch import load_file
-                state_dict = {}
-                for f in st_files:
-                    state_dict.update(load_file(str(f)))
-            except ImportError:
-                raise RuntimeError("Установите safetensors: pip install safetensors")
-        else:
-            bin_files = list(path.glob("*.bin"))
-            if bin_files:
-                state_dict = torch.load(bin_files[0], map_location="cpu", weights_only=True)
-                if not isinstance(state_dict, dict):
-                    state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
-
-    if state_dict is None:
-        # Fallback: загрузить через transformers и взять state_dict (тяжело для больших моделей)
-        try:
-            from transformers import AutoModel
-            model = AutoModel.from_pretrained(model_id)
-            state_dict = model.state_dict()
-            del model
-        except Exception as e:
-            raise FileNotFoundError(
-                f"В репозитории {model_id} не найдены веса и не удалось загрузить через transformers: {e}"
-            ) from e
+    state_dict = load_state_dict_from_dir(path, model_id)
     logger.info("state_dict загружен из кэша: ключей=%d", len(state_dict))
     return state_dict
 
@@ -203,14 +172,19 @@ def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
     return result
 
 
-def prepare_shard_keys(hf_model_id: str, n_workers: int) -> List[List[str]]:
+def prepare_shard_keys(
+    hf_model_id: str,
+    n_workers: int,
+    progress_callback: Callable[[float, int, int, str], None] | None = None,
+) -> List[List[str]]:
     """
     Подготавливает план шардирования (только ключи).
     Мастер и воркеры будут скачивать веса из HF, а воркер загрузит только свой поднабор ключей.
+    progress_callback(percent, bytes_done, bytes_total, current_file) для побайтового прогресса на мастере.
     """
     if n_workers <= 0:
         raise ValueError("n_workers должно быть >= 1")
-    state_dict = _state_dict_from_hf(hf_model_id)
+    state_dict = _state_dict_from_hf(hf_model_id, progress_callback=progress_callback)
     keys = list(state_dict.keys())
     logger.info("Подготовка меток (ключей) для шардов: keys=%d, workers=%d", len(keys), n_workers)
 

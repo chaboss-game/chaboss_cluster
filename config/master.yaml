@@ -1,5 +1,5 @@
-listen_host: "192.168.0.111"
-listen_port: 66666
+listen_host: "192.168.0.110"
+listen_port: 48055
 
 # OpenAI-совместимый HTTP API (для OpenCLaw и др.)
 http_listen_host: "0.0.0.0"
@@ -16,9 +16,9 @@ resource_usage_percent: 75
 # Initial static list of workers.
 workers:
   - host: "192.168.0.109"
-    port: 55555
+    port: 48055
     auth_token: "win10_test"
-  - host: "192.168.0.110"
-    port: 44444
+  - host: "192.168.0.111"
+    port: 48055
     auth_token: "kubuntu25_test"
 

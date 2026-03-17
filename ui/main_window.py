@@ -29,8 +29,15 @@ except ImportError as e:
 
 from .settings_store import load as load_settings, save as save_settings
 
+try:
+    from cluster_core.common.config import load_master_config
+except ImportError:
+    load_master_config = None
+
 DEFAULT_MASTER_ADDR = "127.0.0.1:60051"
 POLL_INTERVAL_MS = 3000
+# Таймаут LoadModel: большие модели (HF download + рассылка воркерам) могут занимать 10–30+ минут
+LOAD_MODEL_TIMEOUT_S = 3600
 WORKER_VISIBILITY_POLL_MS = 5000  # опрос мастера в режиме воркера: виден ли воркер в реестре
 AUTOSAVE_DELAY_MS = 500
 
@@ -64,6 +71,12 @@ def _worker_list_to_dict(worker_list) -> Dict[str, dict]:
 
 
 class MasterPoller(QtCore.QObject):
+    """
+    Периодический опрос мастера (ListWorkers). Вызов poll() идёт по таймеру из MainWindow
+    каждые POLL_INTERVAL_MS — чтобы обновлять таблицу воркеров. Попытки подключения к мастеру
+    происходят не «при запуске мастера», а постоянно по таймеру; при ошибке в лог пишется
+    сообщение через error.emit().
+    """
     workers_updated = QtCore.pyqtSignal(dict)
     error = QtCore.pyqtSignal(str)
 
@@ -113,6 +126,7 @@ def _validate_host_port(addr: str) -> tuple[bool, str]:
 
 class MainWindow(QtWidgets.QMainWindow):
     load_finished = QtCore.pyqtSignal(bool, str)
+    load_progress_event = QtCore.pyqtSignal(object)  # cluster_pb2.LoadModelProgressEvent
     unload_finished = QtCore.pyqtSignal(bool, str)
     apply_workers_finished = QtCore.pyqtSignal(bool, str)
     log_message = QtCore.pyqtSignal(str)  # сообщение для вкладки «Лог» (с меткой времени добавляется в слоте)
@@ -122,6 +136,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Chaboss Cluster")
         self.load_finished.connect(self._on_load_finished)
+        self.load_progress_event.connect(self._on_load_progress_event)
         self.unload_finished.connect(self._on_unload_finished)
         self.apply_workers_finished.connect(self._on_apply_workers_finished)
         self.log_message.connect(self._append_log_line)
@@ -348,25 +363,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setCentralWidget(tabs)
 
-        # Панель визуального прогресса загрузки модели (мастер / воркеры)
+        # Панель визуального прогресса загрузки модели (мастер + воркеры с живым %)
         self._load_stage_label = QtWidgets.QLabel("Ожидание запуска загрузки модели")
         self._load_progress_master = QtWidgets.QProgressBar()
-        self._load_progress_workers = QtWidgets.QProgressBar()
-        for bar in (self._load_progress_master, self._load_progress_workers):
-            bar.setMinimum(0)
-            bar.setMaximum(1)
-            bar.setValue(0)
-        self._load_progress_master.setFormat("Мастер: подготовка / загрузка")
-        self._load_progress_workers.setFormat("Воркеры: загрузка шардов")
+        self._load_progress_master.setMinimum(0)
+        self._load_progress_master.setMaximum(100)
+        self._load_progress_master.setValue(0)
+        self._load_progress_master.setFormat("Мастер: %p% (%v / %m)")
+        self._load_workers_container = QtWidgets.QWidget()
+        self._load_workers_layout = QtWidgets.QVBoxLayout(self._load_workers_container)
+        self._load_workers_layout.setContentsMargins(0, 0, 0, 0)
+        self._load_worker_bars: Dict[str, QtWidgets.QProgressBar] = {}
         load_prog_widget = QtWidgets.QWidget()
         lp_layout = QtWidgets.QVBoxLayout()
         lp_layout.setContentsMargins(6, 6, 6, 6)
         lp_layout.addWidget(QtWidgets.QLabel("Прогресс загрузки модели (HF → мастер → воркеры):"))
         lp_layout.addWidget(self._load_stage_label)
+        lp_layout.addWidget(QtWidgets.QLabel("Мастер (скачивание с HF, разметка шардов):"))
         lp_layout.addWidget(self._load_progress_master)
-        lp_layout.addWidget(self._load_progress_workers)
-        lp_layout.addStretch()
-        load_prog_widget.setLayout(lp_layout)
+        lp_layout.addWidget(QtWidgets.QLabel("Воркеры (скачивание с HF, загрузка шарда):"))
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._load_workers_container)
+        scroll.setMaximumHeight(120)
+        lp_layout.addWidget(scroll)
         self._load_progress_dock = QtWidgets.QDockWidget("Прогресс модели", self)
         self._load_progress_dock.setWidget(load_prog_widget)
         self._load_progress_dock.setFeatures(
@@ -379,6 +399,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._poller.workers_updated.connect(self._on_workers_updated)
         self._poller.error.connect(self._on_poller_error)
+        # Таймер каждые POLL_INTERVAL_MS вызывает _on_timer → poll() → ListWorkers.
+        # Так GUI постоянно обновляет список воркеров; попытки к мастеру идут по таймеру, не при старте мастера.
         self._timer.start(POLL_INTERVAL_MS)
         self._on_timer()
 
@@ -482,16 +504,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.append_log("Запуск мастера (python -m scripts.run_master)...")
         project_root = Path(__file__).resolve().parent.parent
         try:
+            env = os.environ.copy()
+            env["CHABOSS_CLUSTER_FROM_GUI"] = "1"
             self._master_process = subprocess.Popen(
                 [sys.executable, "-m", "scripts.run_master"],
                 cwd=project_root,
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
             self.append_log("Мастер запущен, PID %s" % self._master_process.pid)
             self.statusBar().showMessage(f"Мастер запущен (PID {self._master_process.pid})")
+            # Подставляем адрес мастера из config/master.yaml, чтобы GUI подключался к нему,
+            # а не к старому порту воркера (если этот компьютер раньше был воркером).
+            config_path = project_root / "config" / "master.yaml"
+            if config_path.exists() and load_master_config is not None:
+                try:
+                    cfg = load_master_config(config_path)
+                    addr = f"{cfg.listen_host}:{cfg.listen_port}"
+                    self._addr = addr
+                    self._master_edit.setText(addr)
+                    self._poller.set_master_addr(addr)
+                    self._addr_label.setText(f"Мастер: {addr} (обновление каждые {POLL_INTERVAL_MS // 1000} с)")
+                    self._save_settings()
+                    self.append_log("Адрес мастера установлен из конфига: %s" % addr)
+                except Exception as e:  # noqa: BLE001
+                    self.append_log("Не удалось прочитать адрес мастера из конфига: %s" % e)
             self._update_process_state()
+            # Пауза опроса мастера на 2 с, чтобы мастер успел подняться — иначе в лог пойдут «connection refused».
+            self._timer.stop()
+            QtCore.QTimer.singleShot(2000, self._resume_master_poll)
         except Exception as e:
             self.append_log("Ошибка запуска мастера: %s" % e)
             self.statusBar().showMessage(f"Ошибка запуска мастера: {e}")
@@ -699,7 +742,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(500, self._on_start_worker)
 
     def _on_timer(self) -> None:
+        """По таймеру (каждые POLL_INTERVAL_MS): опрос мастера ListWorkers для обновления таблицы воркеров."""
         threading.Thread(target=self._poller.poll, daemon=True).start()
+
+    def _resume_master_poll(self) -> None:
+        """Возобновить опрос мастера после паузы (например после запуска мастера)."""
+        if getattr(self, "_worker_process", None) is None or self._worker_process.poll() is not None:
+            self._timer.start(POLL_INTERVAL_MS)
 
     def _on_apply_workers_config(self) -> None:
         """Отправить конфиг воркеров на мастер (UpdateWorkersConfig)."""
@@ -761,25 +810,27 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.statusBar().showMessage(f"Загрузка модели {model_id}...")
 
-        # Визуальный прогресс: этап 1 — подготовка мастера (HF, план шардов)
+        # Визуальный прогресс: поток LoadModelStream даёт живой % мастера и воркеров
         self._load_progress_dock.show()
-        self._load_stage_label.setText("Этап 1/2: мастер подготавливает модель (HF → кэш, разметка шардов)")
-        # Индикация «в процессе» — оставляем 0/1, а значение поднимем по завершении этапа.
+        self._load_stage_label.setText("Мастер: начало загрузки с HF...")
         self._load_progress_master.setValue(0)
-        self._load_progress_workers.setValue(0)
-
+        for bar in self._load_worker_bars.values():
+            bar.setValue(0)
         self._model_edit.setEnabled(False)
 
         def do_load():
             try:
                 channel = grpc.insecure_channel(self._addr)
                 stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
-                resp = stub.LoadModel(
+                stream = stub.LoadModelStream(
                     cluster_pb2.LoadModelRequest(hf_model_id=model_id),
-                    timeout=300.0,
                 )
+                for ev in stream:
+                    self.load_progress_event.emit(ev)
+                    if ev.done:
+                        self.load_finished.emit(ev.ok, ev.error or "")
+                        break
                 channel.close()
-                self.load_finished.emit(resp.ok, resp.error or "")
             except Exception as e:
                 self.load_finished.emit(False, str(e))
 
@@ -787,17 +838,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_load_error_dialog(self, error: str) -> None:
         """Диалог при ошибке загрузки модели с подсказками по ресурсам и режиму."""
+        deadline_hint = ""
+        if "Deadline Exceeded" in error or "DEADLINE_EXCEEDED" in error:
+            deadline_hint = (
+                "• Ошибка «Deadline Exceeded»: операция не успела за отведённое время. "
+                "Для больших моделей загрузка с HuggingFace и рассылка по воркерам занимает много минут. "
+                "Таймаут увеличен до 1 часа; при медленной сети попробуйте снова или проверьте логи мастера/воркеров.\n\n"
+            )
         msg = (
             "Ошибка загрузки модели:\n\n%s\n\n"
             "Подробные причины смотрите в логах мастера и воркеров "
             "(консоль, где запущены master/worker, или журнал приложения).\n\n"
+            "%s"
             "Рекомендации:\n"
             "• Если модель не влезает в выбранный %% свободных ресурсов — увеличьте "
             "«Использование свободных ресурсов (%%)» в настройках (например, до 80–90%%).\n"
             "• Если модель не влезает даже при 100%%:\n"
             "  (a) Переключитесь в режим «Модель по частям (стриминг)»;\n"
             "  (b) Добавьте воркеров в кластер для увеличения суммарных ресурсов."
-        ) % error
+        ) % (error, deadline_hint)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Ошибка загрузки модели")
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
@@ -805,20 +864,43 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
         box.exec()
 
+    def _on_load_progress_event(self, ev) -> None:
+        """Обновить прогресс-бары из потока LoadModelStream."""
+        if ev.master and ev.master.percent >= 0:
+            self._load_progress_master.setValue(min(100, ev.master.percent))
+            stage = ev.master.stage or "download"
+            if ev.master.current_file:
+                self._load_stage_label.setText("Мастер: %s — %s (%d%%)" % (stage, ev.master.current_file, ev.master.percent))
+            else:
+                self._load_stage_label.setText("Мастер: %s (%d%%)" % (stage, ev.master.percent))
+        for key, prog in ev.workers.items():
+            if key not in self._load_worker_bars:
+                bar = QtWidgets.QProgressBar()
+                bar.setMinimum(0)
+                bar.setMaximum(100)
+                bar.setValue(0)
+                bar.setFormat("%s: %%p%%" % key)
+                self._load_worker_bars[key] = bar
+                self._load_workers_layout.addWidget(bar)
+            self._load_worker_bars[key].setValue(min(100, prog.percent))
+        if ev.done:
+            if ev.ok:
+                self._load_stage_label.setText("Модель успешно загружена: мастер и воркеры готовы")
+            else:
+                self._load_stage_label.setText("Ошибка при загрузке модели — см. сообщение ниже")
+
     def _on_load_finished(self, ok: bool, error: str) -> None:
         self._model_edit.setEnabled(True)
         if ok:
-            # Этапы 1/2 и 2/2 завершены успешно.
-            self._load_progress_master.setValue(1)
-            self._load_progress_workers.setValue(1)
-            self._load_stage_label.setText("Модель успешно загружена: мастер и воркеры готовы")
+            self._load_progress_master.setValue(100)
+            for bar in self._load_worker_bars.values():
+                bar.setValue(100)
             self.append_log("Модель загружена и разослана воркерам")
             self.statusBar().showMessage("Модель загружена и разослана воркерам")
         else:
-            # Ошибка: фиксируем в прогрессе и не скрываем панель, чтобы пользователь видел состояние.
             self._load_progress_master.setValue(0)
-            self._load_progress_workers.setValue(0)
-            self._load_stage_label.setText("Ошибка при загрузке модели — см. сообщение ниже и логи мастера/воркеров")
+            for bar in self._load_worker_bars.values():
+                bar.setValue(0)
             self.append_log("Ошибка загрузки модели: " + error)
             self.statusBar().showMessage(f"Ошибка: {error}")
             self._show_load_error_dialog(error)
