@@ -78,6 +78,12 @@ class MasterNode:
 
     def start_background(self) -> None:
         """Старт: первичное подключение к воркерам и поток HealthStream для каждого из конфига."""
+        n = len(self._cfg.workers)
+        if n == 0:
+            logger.warning(
+                "В конфиге мастера нет воркеров (workers: []). "
+                "Добавьте воркеров в config/master.yaml или в UI нажмите «Применить конфиг на мастере»."
+            )
         with self._lock:
             self._desired_worker_configs = {f"{w.host}:{w.port}": w for w in self._cfg.workers}
         for w_cfg in self._cfg.workers:
@@ -92,7 +98,7 @@ class MasterNode:
                 name=f"health-{key}",
             )
             t.start()
-        logger.info("Started health stream threads for %d workers", len(self._cfg.workers))
+        logger.info("Started health stream threads for %d workers from config", n)
 
     def stop(self) -> None:
         self._stop_event.set()
