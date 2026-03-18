@@ -69,6 +69,16 @@ class WorkerServiceStub(object):
                 request_serializer=cluster__pb2.RemoteUpdateRequest.SerializeToString,
                 response_deserializer=cluster__pb2.RemoteUpdateResponse.FromString,
                 _registered_method=True)
+        self.GetWorkerLogs = channel.unary_unary(
+                '/cluster.WorkerService/GetWorkerLogs',
+                request_serializer=cluster__pb2.GetWorkerLogsRequest.SerializeToString,
+                response_deserializer=cluster__pb2.GetWorkerLogsResponse.FromString,
+                _registered_method=True)
+        self.ReceiveChatMessage = channel.stream_unary(
+                '/cluster.WorkerService/ReceiveChatMessage',
+                request_serializer=cluster__pb2.ChatPostChunk.SerializeToString,
+                response_deserializer=cluster__pb2.ReceiveChatMessageResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -116,6 +126,19 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetWorkerLogs(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReceiveChatMessage(self, request_iterator, context):
+        """Клиентский стрим: мастер отправляет заголовок сообщения + чанки вложений.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -153,6 +176,16 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.RemoteUpdate,
                     request_deserializer=cluster__pb2.RemoteUpdateRequest.FromString,
                     response_serializer=cluster__pb2.RemoteUpdateResponse.SerializeToString,
+            ),
+            'GetWorkerLogs': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWorkerLogs,
+                    request_deserializer=cluster__pb2.GetWorkerLogsRequest.FromString,
+                    response_serializer=cluster__pb2.GetWorkerLogsResponse.SerializeToString,
+            ),
+            'ReceiveChatMessage': grpc.stream_unary_rpc_method_handler(
+                    servicer.ReceiveChatMessage,
+                    request_deserializer=cluster__pb2.ChatPostChunk.FromString,
+                    response_serializer=cluster__pb2.ReceiveChatMessageResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -354,6 +387,60 @@ class WorkerService(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def GetWorkerLogs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.WorkerService/GetWorkerLogs',
+            cluster__pb2.GetWorkerLogsRequest.SerializeToString,
+            cluster__pb2.GetWorkerLogsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReceiveChatMessage(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/cluster.WorkerService/ReceiveChatMessage',
+            cluster__pb2.ChatPostChunk.SerializeToString,
+            cluster__pb2.ReceiveChatMessageResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class MasterAdminServiceStub(object):
     """Missing associated documentation comment in .proto file."""
@@ -393,6 +480,36 @@ class MasterAdminServiceStub(object):
                 '/cluster.MasterAdminService/RemoteUpdateWorkers',
                 request_serializer=cluster__pb2.RemoteUpdateWorkersRequest.SerializeToString,
                 response_deserializer=cluster__pb2.RemoteUpdateWorkersResponse.FromString,
+                _registered_method=True)
+        self.GetClusterLogs = channel.unary_unary(
+                '/cluster.MasterAdminService/GetClusterLogs',
+                request_serializer=cluster__pb2.GetClusterLogsRequest.SerializeToString,
+                response_deserializer=cluster__pb2.GetClusterLogsResponse.FromString,
+                _registered_method=True)
+        self.ListChatChannels = channel.unary_unary(
+                '/cluster.MasterAdminService/ListChatChannels',
+                request_serializer=cluster__pb2.Empty.SerializeToString,
+                response_deserializer=cluster__pb2.ChatChannelsResponse.FromString,
+                _registered_method=True)
+        self.MutateChatChannels = channel.unary_unary(
+                '/cluster.MasterAdminService/MutateChatChannels',
+                request_serializer=cluster__pb2.ChatChannelsMutationRequest.SerializeToString,
+                response_deserializer=cluster__pb2.ChatChannelsResponse.FromString,
+                _registered_method=True)
+        self.PostChatMessage = channel.stream_unary(
+                '/cluster.MasterAdminService/PostChatMessage',
+                request_serializer=cluster__pb2.ChatPostChunk.SerializeToString,
+                response_deserializer=cluster__pb2.PostChatMessageResponse.FromString,
+                _registered_method=True)
+        self.GetChatHistory = channel.unary_unary(
+                '/cluster.MasterAdminService/GetChatHistory',
+                request_serializer=cluster__pb2.GetChatHistoryRequest.SerializeToString,
+                response_deserializer=cluster__pb2.ChatHistoryResponse.FromString,
+                _registered_method=True)
+        self.GetChatAttachment = channel.unary_stream(
+                '/cluster.MasterAdminService/GetChatAttachment',
+                request_serializer=cluster__pb2.GetChatAttachmentRequest.SerializeToString,
+                response_deserializer=cluster__pb2.ChatAttachmentChunk.FromString,
                 _registered_method=True)
 
 
@@ -435,6 +552,43 @@ class MasterAdminServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetClusterLogs(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListChatChannels(self, request, context):
+        """Чат
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def MutateChatChannels(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PostChatMessage(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetChatHistory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetChatAttachment(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MasterAdminServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -467,6 +621,36 @@ def add_MasterAdminServiceServicer_to_server(servicer, server):
                     servicer.RemoteUpdateWorkers,
                     request_deserializer=cluster__pb2.RemoteUpdateWorkersRequest.FromString,
                     response_serializer=cluster__pb2.RemoteUpdateWorkersResponse.SerializeToString,
+            ),
+            'GetClusterLogs': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetClusterLogs,
+                    request_deserializer=cluster__pb2.GetClusterLogsRequest.FromString,
+                    response_serializer=cluster__pb2.GetClusterLogsResponse.SerializeToString,
+            ),
+            'ListChatChannels': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListChatChannels,
+                    request_deserializer=cluster__pb2.Empty.FromString,
+                    response_serializer=cluster__pb2.ChatChannelsResponse.SerializeToString,
+            ),
+            'MutateChatChannels': grpc.unary_unary_rpc_method_handler(
+                    servicer.MutateChatChannels,
+                    request_deserializer=cluster__pb2.ChatChannelsMutationRequest.FromString,
+                    response_serializer=cluster__pb2.ChatChannelsResponse.SerializeToString,
+            ),
+            'PostChatMessage': grpc.stream_unary_rpc_method_handler(
+                    servicer.PostChatMessage,
+                    request_deserializer=cluster__pb2.ChatPostChunk.FromString,
+                    response_serializer=cluster__pb2.PostChatMessageResponse.SerializeToString,
+            ),
+            'GetChatHistory': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetChatHistory,
+                    request_deserializer=cluster__pb2.GetChatHistoryRequest.FromString,
+                    response_serializer=cluster__pb2.ChatHistoryResponse.SerializeToString,
+            ),
+            'GetChatAttachment': grpc.unary_stream_rpc_method_handler(
+                    servicer.GetChatAttachment,
+                    request_deserializer=cluster__pb2.GetChatAttachmentRequest.FromString,
+                    response_serializer=cluster__pb2.ChatAttachmentChunk.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -631,6 +815,168 @@ class MasterAdminService(object):
             '/cluster.MasterAdminService/RemoteUpdateWorkers',
             cluster__pb2.RemoteUpdateWorkersRequest.SerializeToString,
             cluster__pb2.RemoteUpdateWorkersResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetClusterLogs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/GetClusterLogs',
+            cluster__pb2.GetClusterLogsRequest.SerializeToString,
+            cluster__pb2.GetClusterLogsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListChatChannels(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/ListChatChannels',
+            cluster__pb2.Empty.SerializeToString,
+            cluster__pb2.ChatChannelsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def MutateChatChannels(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/MutateChatChannels',
+            cluster__pb2.ChatChannelsMutationRequest.SerializeToString,
+            cluster__pb2.ChatChannelsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PostChatMessage(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/cluster.MasterAdminService/PostChatMessage',
+            cluster__pb2.ChatPostChunk.SerializeToString,
+            cluster__pb2.PostChatMessageResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetChatHistory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/GetChatHistory',
+            cluster__pb2.GetChatHistoryRequest.SerializeToString,
+            cluster__pb2.ChatHistoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetChatAttachment(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/cluster.MasterAdminService/GetChatAttachment',
+            cluster__pb2.GetChatAttachmentRequest.SerializeToString,
+            cluster__pb2.ChatAttachmentChunk.FromString,
             options,
             channel_credentials,
             insecure,

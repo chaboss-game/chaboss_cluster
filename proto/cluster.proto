@@ -138,6 +138,15 @@ message RemoteUpdateResponse {
   string output = 3;         // stdout/stderr git pull + доп. сообщения
 }
 
+message GetWorkerLogsRequest {
+  int64 since_index = 1;     // 0 = все доступные
+}
+
+message GetWorkerLogsResponse {
+  repeated string lines = 1;
+  int64 next_index = 2;
+}
+
 service WorkerService {
   rpc GetStatus(WorkerId) returns (WorkerDescriptor);
   rpc GetLoadProgress(WorkerId) returns (GetLoadProgressResponse);
@@ -146,6 +155,9 @@ service WorkerService {
   rpc RunStage(stream StageRequest) returns (stream StageResponse);
   rpc HealthStream(stream HealthPing) returns (stream HealthPong);
   rpc RemoteUpdate(RemoteUpdateRequest) returns (RemoteUpdateResponse);
+  rpc GetWorkerLogs(GetWorkerLogsRequest) returns (GetWorkerLogsResponse);
+  // Клиентский стрим: мастер отправляет заголовок сообщения + чанки вложений.
+  rpc ReceiveChatMessage(stream ChatPostChunk) returns (ReceiveChatMessageResponse);
 }
 
 // Admin API (master-side), for UI and external tools.
@@ -227,6 +239,22 @@ message UnloadModelResponse {
   string error = 2;
 }
 
+message GetClusterLogsRequest {
+  int64 master_since = 1;
+  map<string, int64> worker_since = 2;  // key "host:port" -> since_index
+}
+
+message WorkerLogsChunk {
+  repeated string lines = 1;
+  int64 next_index = 2;
+}
+
+message GetClusterLogsResponse {
+  repeated string master_lines = 1;
+  int64 master_next = 2;
+  map<string, WorkerLogsChunk> worker_logs = 3;  // key "host:port" -> chunk
+}
+
 service MasterAdminService {
   rpc ListWorkers(Empty) returns (WorkerList);
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
@@ -234,5 +262,127 @@ service MasterAdminService {
   rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
   rpc UpdateWorkersConfig(UpdateWorkersConfigRequest) returns (UpdateWorkersConfigResponse);
   rpc RemoteUpdateWorkers(RemoteUpdateWorkersRequest) returns (RemoteUpdateWorkersResponse);
+  rpc GetClusterLogs(GetClusterLogsRequest) returns (GetClusterLogsResponse);
+  // Чат
+  rpc ListChatChannels(Empty) returns (ChatChannelsResponse);
+  rpc MutateChatChannels(ChatChannelsMutationRequest) returns (ChatChannelsResponse);
+  rpc PostChatMessage(stream ChatPostChunk) returns (PostChatMessageResponse);
+  rpc GetChatHistory(GetChatHistoryRequest) returns (ChatHistoryResponse);
+  rpc GetChatAttachment(GetChatAttachmentRequest) returns (stream ChatAttachmentChunk);
+}
+
+// =========================
+// Chat (channels/messages/files)
+// =========================
+
+message ChatChannelInfo {
+  string id = 1;
+  string name = 2;
+}
+
+message ChatChannelsResponse {
+  repeated ChatChannelInfo channels = 1;
+}
+
+enum ChatChannelMutationType {
+  CHAT_CHANNEL_CREATE = 0;
+  CHAT_CHANNEL_RENAME = 1;
+  CHAT_CHANNEL_DELETE = 2;
+}
+
+message ChatChannelMutation {
+  ChatChannelMutationType type = 1;
+  string channel_id = 2;
+  string name = 3;
+}
+
+message ChatChannelsMutationRequest {
+  repeated ChatChannelMutation ops = 1;
+}
+
+message ChatPostAttachmentMeta {
+  string attachment_id = 1;
+  string filename = 2;
+  string mime_type = 3;
+  bool is_image = 4;
+  int64 size = 5;
+  // Для image/* пересылаем миниатюру (JPEG) прямо в заголовке, чтобы GUI не делало вычисления.
+  bytes thumbnail_jpeg = 6;
+}
+
+message ChatPostHeader {
+  string message_id = 1;
+  int64 timestamp_ms = 2;
+  string channel_id = 3;
+  string sender = 4;
+  string text = 5;
+  // Только выбранные воркеры (host:port), которым мастер должен переслать вложения/сообщение.
+  repeated string target_worker_keys = 6;
+  repeated ChatPostAttachmentMeta attachments = 7;
+}
+
+message ChatPostAttachmentChunk {
+  string attachment_id = 1;
+  bytes data = 2;
+  bool is_last = 3;
+}
+
+message ChatPostChunk {
+  oneof payload {
+    ChatPostHeader header = 1;
+    ChatPostAttachmentChunk attachment_chunk = 2;
+  }
+}
+
+message ReceiveChatMessageResponse {
+  bool ok = 1;
+  string error = 2;
+  string message_id = 3;
+}
+
+message PostChatMessageResponse {
+  bool ok = 1;
+  string error = 2;
+  string message_id = 3;
+}
+
+message ChatAttachmentMeta {
+  string attachment_id = 1;
+  string filename = 2;
+  string mime_type = 3;
+  bool is_image = 4;
+  int64 size = 5;
+  bytes thumbnail_jpeg = 6; // может быть пустым для не-фото
+}
+
+message ChatMessage {
+  string message_id = 1;
+  int64 seq = 2;
+  int64 timestamp_ms = 3;
+  string channel_id = 4;
+  string sender = 5;
+  string text = 6;
+  repeated ChatAttachmentMeta attachments = 7;
+}
+
+message GetChatHistoryRequest {
+  string channel_id = 1;
+  int64 since_seq = 2; // 0 = от начала буфера
+  int32 limit = 3;    // максимум сообщений
+}
+
+message ChatHistoryResponse {
+  repeated ChatMessage messages = 1;
+  int64 next_seq = 2;
+}
+
+message GetChatAttachmentRequest {
+  string message_id = 1;
+  string attachment_id = 2;
+}
+
+message ChatAttachmentChunk {
+  bytes data = 1;
+  bool is_last = 2;
 }
 

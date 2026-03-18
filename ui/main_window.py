@@ -9,6 +9,10 @@ import os
 import sys
 import subprocess
 import threading
+import uuid
+import mimetypes
+import base64
+import time
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +40,7 @@ except ImportError:
 
 DEFAULT_MASTER_ADDR = "127.0.0.1:60051"
 POLL_INTERVAL_MS = 3000
+LOG_POLL_MS = 2000  # опрос логов мастера и воркеров для отображения в окне логов
 # Таймаут LoadModel: большие модели (HF download + рассылка воркерам) могут занимать 10–30+ минут
 LOAD_MODEL_TIMEOUT_S = 3600
 WORKER_VISIBILITY_POLL_MS = 5000  # опрос мастера в режиме воркера: виден ли воркер в реестре
@@ -130,7 +135,16 @@ class MainWindow(QtWidgets.QMainWindow):
     unload_finished = QtCore.pyqtSignal(bool, str)
     apply_workers_finished = QtCore.pyqtSignal(bool, str)
     log_message = QtCore.pyqtSignal(str)  # сообщение для вкладки «Лог» (с меткой времени добавляется в слоте)
+    remote_log_lines = QtCore.pyqtSignal(list)  # строки логов мастера/воркеров без доп. метки времени
+    log_since_updated = QtCore.pyqtSignal(int, dict)  # master_next, worker_since для следующего опроса
     worker_master_status = QtCore.pyqtSignal(str, str)  # (ключ воркера или "", статус в реестре мастера)
+
+    # Чат
+    chat_history_received = QtCore.pyqtSignal(object)  # list[dict]
+    chat_channels_received = QtCore.pyqtSignal(list)  # list[(id,name)]
+    chat_clipboard_set_text = QtCore.pyqtSignal(str)
+    chat_clipboard_set_image = QtCore.pyqtSignal(object)
+    chat_send_finished = QtCore.pyqtSignal(bool, str)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
@@ -140,7 +154,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.unload_finished.connect(self._on_unload_finished)
         self.apply_workers_finished.connect(self._on_apply_workers_finished)
         self.log_message.connect(self._append_log_line)
+        self.remote_log_lines.connect(self._append_remote_log_lines)
+        self.log_since_updated.connect(self._on_log_since_updated)
         self.worker_master_status.connect(self._on_worker_master_status)
+
+        # Чат
+        self.chat_history_received.connect(self._chat_render_messages)
+        self.chat_channels_received.connect(self._chat_render_channels)
+        self.chat_clipboard_set_text.connect(self._chat_set_clipboard_text)
+        self.chat_clipboard_set_image.connect(self._chat_set_clipboard_image)
+        self.chat_send_finished.connect(self._chat_on_send_finished)
 
         settings = load_settings()
         self._addr = (
@@ -157,6 +180,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_settings)
+        self._logs_poll_timer = QtCore.QTimer(self)
+        self._logs_poll_timer.timeout.connect(self._poll_cluster_logs)
+        self._log_master_since = 0
+        self._log_worker_since: Dict[str, int] = {}
 
         self._table_model = WorkerTableModel()
         table = QtWidgets.QTableView()
@@ -179,7 +206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_text = QtWidgets.QPlainTextEdit()
         self._log_text.setReadOnly(True)
         self._log_text.setPlaceholderText(
-            "Здесь отображаются процессы выгрузки/загрузки модели, статусы воркеров и прочие события."
+            "События GUI, логи мастера и воркеров (то же, что пишется в файлы на соответствующих узлах)."
         )
         log_layout.addWidget(self._log_text)
         clear_log_btn = QtWidgets.QPushButton("Очистить лог")
@@ -330,6 +357,109 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_page = QtWidgets.QWidget()
         settings_page.setLayout(settings_layout)
 
+        # ——— Вкладка «Чат» ———
+        chat_tab = QtWidgets.QWidget()
+        chat_tab_layout = QtWidgets.QVBoxLayout()
+
+        chat_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+
+        # Панель каналов
+        chat_channels_panel = QtWidgets.QWidget()
+        chat_channels_layout = QtWidgets.QVBoxLayout()
+        chat_channels_layout.addWidget(QtWidgets.QLabel("Канал:"))
+        self._chat_channels_combo = QtWidgets.QComboBox()
+        self._chat_channels_combo.currentIndexChanged.connect(self._chat_on_channel_changed)
+        chat_channels_layout.addWidget(self._chat_channels_combo)
+
+        chat_channels_btns = QtWidgets.QHBoxLayout()
+        add_channel_btn = QtWidgets.QPushButton("Создать")
+        rename_channel_btn = QtWidgets.QPushButton("Переименовать")
+        del_channel_btn = QtWidgets.QPushButton("Удалить")
+        add_channel_btn.clicked.connect(self._chat_create_channel)
+        rename_channel_btn.clicked.connect(self._chat_rename_channel)
+        del_channel_btn.clicked.connect(self._chat_delete_channel)
+        chat_channels_btns.addWidget(add_channel_btn)
+        chat_channels_btns.addWidget(rename_channel_btn)
+        chat_channels_btns.addWidget(del_channel_btn)
+        chat_channels_layout.addLayout(chat_channels_btns)
+        chat_channels_layout.addStretch()
+        chat_channels_panel.setLayout(chat_channels_layout)
+
+        # Панель сообщений
+        chat_messages_panel = QtWidgets.QWidget()
+        chat_messages_layout = QtWidgets.QVBoxLayout()
+        chat_messages_layout.addWidget(QtWidgets.QLabel("Сообщения:"))
+        self._chat_messages_list = QtWidgets.QListWidget()
+        self._chat_messages_list.currentRowChanged.connect(self._chat_on_message_selected)
+        chat_messages_layout.addWidget(self._chat_messages_list, 1)
+        chat_messages_panel.setLayout(chat_messages_layout)
+
+        # Панель вложений выбранного сообщения
+        chat_attach_panel = QtWidgets.QWidget()
+        chat_attach_layout = QtWidgets.QVBoxLayout()
+        chat_attach_layout.addWidget(QtWidgets.QLabel("Вложения:"))
+        self._chat_attachments_scroll = QtWidgets.QScrollArea()
+        self._chat_attachments_scroll.setWidgetResizable(True)
+        self._chat_attachments_container = QtWidgets.QWidget()
+        self._chat_attachments_layout = QtWidgets.QVBoxLayout()
+        self._chat_attachments_layout.setContentsMargins(6, 6, 6, 6)
+        self._chat_attachments_container.setLayout(self._chat_attachments_layout)
+        self._chat_attachments_scroll.setWidget(self._chat_attachments_container)
+        chat_attach_layout.addWidget(self._chat_attachments_scroll, 1)
+        chat_attach_panel.setLayout(chat_attach_layout)
+
+        chat_split.addWidget(chat_channels_panel)
+        chat_split.addWidget(chat_messages_panel)
+        chat_split.addWidget(chat_attach_panel)
+        chat_split.setStretchFactor(0, 1)
+        chat_split.setStretchFactor(1, 3)
+        chat_split.setStretchFactor(2, 2)
+        chat_tab_layout.addWidget(chat_split, 3)
+
+        # Панель отправки (получатели/текст/вложения)
+        send_grp = QtWidgets.QGroupBox("Отправка")
+        send_layout = QtWidgets.QVBoxLayout()
+
+        send_layout.addWidget(QtWidgets.QLabel("Получатели (выбранные воркеры онлайн):"))
+        self._chat_workers_checklist = QtWidgets.QListWidget()
+        self._chat_workers_checklist.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        send_layout.addWidget(self._chat_workers_checklist)
+
+        send_layout.addWidget(QtWidgets.QLabel("Текст:"))
+        self._chat_text_edit = QtWidgets.QTextEdit()
+        self._chat_text_edit.setPlaceholderText("Введите сообщение...")
+        self._chat_text_edit.setFixedHeight(60)
+        send_layout.addWidget(self._chat_text_edit)
+
+        attach_row = QtWidgets.QHBoxLayout()
+        self._chat_add_files_btn = QtWidgets.QPushButton("Добавить файлы")
+        self._chat_add_files_btn.clicked.connect(self._chat_pick_files)
+        attach_row.addWidget(self._chat_add_files_btn)
+
+        self._chat_drop_area = QtWidgets.QFrame()
+        self._chat_drop_area.setFrameShape(QtWidgets.QFrame.Shape.Box)
+        self._chat_drop_area.setAcceptDrops(True)
+        self._chat_drop_area.setToolTip("Перетащите файлы сюда (до 20MB каждый, до 5 штук)")
+        drop_layout = QtWidgets.QVBoxLayout()
+        self._chat_drop_label = QtWidgets.QLabel("Drag & Drop файлов/фото сюда")
+        drop_layout.addWidget(self._chat_drop_label)
+        self._chat_drop_area.setLayout(drop_layout)
+        # Внутри PyQt6 обработчики drag&drop проще навесить через subclass, но для MVP хватит eventFilter.
+        self._chat_drop_area.installEventFilter(self)
+        attach_row.addWidget(self._chat_drop_area, 1)
+        send_layout.addLayout(attach_row)
+
+        self._chat_selected_files_list = QtWidgets.QListWidget()
+        send_layout.addWidget(self._chat_selected_files_list)
+
+        self._chat_send_btn = QtWidgets.QPushButton("Отправить")
+        self._chat_send_btn.clicked.connect(self._chat_send_message)
+        self._chat_send_status = QtWidgets.QLabel("")
+        send_layout.addWidget(self._chat_send_btn)
+        send_layout.addWidget(self._chat_send_status)
+        chat_tab_layout.addWidget(send_grp, 1)
+        chat_tab.setLayout(chat_tab_layout)
+
         # ——— Вкладка «Воркер» ———
         worker_tab = QtWidgets.QWidget()
         worker_tab_layout = QtWidgets.QVBoxLayout()
@@ -362,6 +492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(workers_page, "Кластер")
         tabs.addTab(settings_page, "Настройки")
+        tabs.addTab(chat_tab, "Чат")
         tabs.addTab(worker_tab, "Воркер")
 
         self.setCentralWidget(tabs)
@@ -408,6 +539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Таймер каждые POLL_INTERVAL_MS вызывает _on_timer → poll() → ListWorkers.
         # Так GUI постоянно обновляет список воркеров; попытки к мастеру идут по таймеру, не при старте мастера.
         self._timer.start(POLL_INTERVAL_MS)
+        self._logs_poll_timer.start(LOG_POLL_MS)
         self._on_timer()
 
         # Применить загруженные настройки (модель, таблица воркеров, режим, ресурсы)
@@ -425,6 +557,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._update_process_state()
         self.append_log("Запуск приложения. Подключение к мастеру: " + self._addr)
+
+        # Чат: init и первая загрузка каналов
+        self._chat_init_state()
+        self._chat_load_channels()
 
     def _load_workers_into_table(self, workers: List[dict]) -> None:
         self._workers_table.blockSignals(True)
@@ -490,6 +626,43 @@ class MainWindow(QtWidgets.QMainWindow):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._log_text.appendPlainText(f"[{ts}] {message}")
 
+    def _append_remote_log_lines(self, lines: List[str]) -> None:
+        for line in lines:
+            self._log_text.appendPlainText(line)
+
+    def _on_log_since_updated(self, master_next: int, worker_since: dict) -> None:
+        self._log_master_since = master_next
+        self._log_worker_since = dict(worker_since) if worker_since else {}
+
+    def _poll_cluster_logs(self) -> None:
+        """Запросить логи мастера и воркеров и добавить новые строки в окно логов."""
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            return
+        master_since = getattr(self, "_log_master_since", 0)
+        worker_since = getattr(self, "_log_worker_since", {})
+        req = cluster_pb2.GetClusterLogsRequest(master_since=master_since, worker_since=worker_since)
+
+        def do_fetch() -> None:
+            try:
+                channel = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                resp = stub.GetClusterLogs(req, timeout=5.0)
+                channel.close()
+            except Exception:
+                return
+            lines: List[str] = []
+            for line in resp.master_lines:
+                lines.append("[master] " + line)
+            for key, chunk in resp.worker_logs.items():
+                for line in chunk.lines:
+                    lines.append(f"[{key}] " + line)
+            if lines:
+                self.remote_log_lines.emit(lines)
+            worker_next = {k: v.next_index for k, v in resp.worker_logs.items()}
+            self.log_since_updated.emit(resp.master_next, worker_next)
+        threading.Thread(target=do_fetch, daemon=True).start()
+
     def _apply_master_addr_from_edit(self) -> None:
         addr = self._master_edit.text().strip() or DEFAULT_MASTER_ADDR
         ok, err = _validate_host_port(addr)
@@ -540,6 +713,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_process_state()
             # Пауза опроса мастера на 2 с, чтобы мастер успел подняться — иначе в лог пойдут «connection refused».
             self._timer.stop()
+            self._logs_poll_timer.stop()
             QtCore.QTimer.singleShot(2000, self._resume_master_poll)
         except Exception as e:
             self.append_log("Ошибка запуска мастера: %s" % e)
@@ -637,6 +811,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker_master_status_text = "В реестре мастера: проверка..."
             self._refresh_worker_status_label()
             self._timer.stop()
+            self._logs_poll_timer.stop()
             self._worker_visibility_timer.start(WORKER_VISIBILITY_POLL_MS)
             self._poll_worker_visibility()
             self._start_master_btn.setEnabled(False)
@@ -653,6 +828,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cluster_stack.setCurrentIndex(0)
             self._worker_visibility_timer.stop()
             self._timer.start(POLL_INTERVAL_MS)
+            self._logs_poll_timer.start(LOG_POLL_MS)
             self._start_master_btn.setEnabled(True)
             self._stop_master_btn.setEnabled(True)
             self._restart_master_btn.setEnabled(True)
@@ -669,6 +845,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker_status_label.setText("Режим: Воркер\nПорт: —\nСтатус: не запущен")
             self._worker_visibility_timer.stop()
             self._timer.start(POLL_INTERVAL_MS)
+            self._logs_poll_timer.start(LOG_POLL_MS)
             self._start_master_btn.setEnabled(True)
             self._stop_master_btn.setEnabled(True)
             self._restart_master_btn.setEnabled(True)
@@ -755,6 +932,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Возобновить опрос мастера после паузы (например после запуска мастера)."""
         if getattr(self, "_worker_process", None) is None or self._worker_process.poll() is not None:
             self._timer.start(POLL_INTERVAL_MS)
+            self._logs_poll_timer.start(LOG_POLL_MS)
 
     def _on_apply_workers_config(self) -> None:
         """Отправить конфиг воркеров на мастер (UpdateWorkersConfig)."""
@@ -1100,6 +1278,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.append_log("Воркер %s: статус %s → %s" % (key, old_s, new_s))
 
         self._last_workers_dict = dict(workers)
+        if hasattr(self, "_chat_workers_checklist"):
+            self._chat_sync_workers_checklist(workers)
         self._update_resources_label(workers)
 
         # Блокировка работы с моделью при несоответствии токенов
@@ -1118,6 +1298,603 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Ошибка: {msg}")
         self._table_model.update_workers({})
         self._last_workers_dict = {}
+
+    # =========================
+    # Chat UI / logic
+    # =========================
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        # Drag & Drop для вложений
+        if hasattr(self, "_chat_drop_area") and obj is self._chat_drop_area:
+            if event.type() == QtCore.QEvent.Type.DragEnter:
+                mime = event.mimeData()
+                if mime is not None and mime.hasUrls():
+                    event.acceptProposedAction()
+                    return True
+            if event.type() == QtCore.QEvent.Type.Drop:
+                mime = event.mimeData()
+                paths: List[str] = []
+                if mime is not None and mime.hasUrls():
+                    for url in mime.urls():
+                        if url.isLocalFile():
+                            paths.append(url.toLocalFile())
+                if paths:
+                    self._chat_add_attachments(paths)
+                event.acceptProposedAction()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _chat_init_state(self) -> None:
+        if hasattr(self, "_chat_pending_attachments"):
+            return
+        self._chat_pending_attachments: List[dict] = []
+        self._chat_messages: List[dict] = []
+        self._chat_attachment_cache: Dict[str, bytes] = {}
+        self._chat_last_seq = 0
+        self._chat_active_channel_id: str = ""
+
+        self._chat_poll_timer = QtCore.QTimer(self)
+        self._chat_poll_timer.setInterval(2000)
+        self._chat_poll_timer.timeout.connect(lambda: self._chat_poll_history(force=False))
+        self._chat_poll_timer.start()
+
+    def _chat_load_channels(self) -> None:
+        """Подгрузить список каналов из мастера."""
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            return
+
+        def do_fetch() -> None:
+            try:
+                channel = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                resp = stub.ListChatChannels(cluster_pb2.Empty(), timeout=10.0)
+                channel.close()
+                channels = [(c.id or "", c.name or "") for c in resp.channels or [] if (c.id or "").strip()]
+                self.chat_channels_received.emit(channels)
+            except Exception as e:
+                self.chat_channels_received.emit([])
+                self.append_log("Ошибка загрузки каналов: %s" % e)
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _chat_render_channels(self, channels: List[tuple]) -> None:
+        if not channels:
+            # fallback: общий канал
+            self._chat_channels_combo.clear()
+            self._chat_channels_combo.addItem("general", userData="general")
+            self._chat_active_channel_id = "general"
+            self._chat_last_seq = 0
+            return
+
+        current = self._chat_channels_combo.currentData() if hasattr(self, "_chat_channels_combo") else None
+        self._chat_channels_combo.blockSignals(True)
+        self._chat_channels_combo.clear()
+        for cid, name in channels:
+            cid = str(cid)
+            name = str(name)
+            if not cid:
+                continue
+            self._chat_channels_combo.addItem(name, userData=cid)
+        self._chat_channels_combo.blockSignals(False)
+
+        # выбор текущего или general
+        idx = self._chat_channels_combo.findData("general")
+        if idx < 0:
+            idx = 0
+        if idx >= 0:
+            self._chat_channels_combo.setCurrentIndex(idx)
+        else:
+            self._chat_active_channel_id = "general"
+
+    def _chat_name_to_id(self, name: str) -> str:
+        base = (name or "").strip().lower()
+        base = re.sub(r"[^a-z0-9_-]+", "_", base)
+        base = base.strip("_")
+        return base or f"channel_{uuid.uuid4().hex[:8]}"
+
+    def _chat_create_channel(self) -> None:
+        name, ok = QtWidgets.QInputDialog.getText(self, "Создать канал", "Имя канала:")
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            return
+        channel_id = self._chat_name_to_id(name)
+
+        self._chat_mutate_channels_async([
+            {
+                "type": cluster_pb2.ChatChannelMutationType.CHAT_CHANNEL_CREATE,
+                "channel_id": channel_id,
+                "name": name,
+            }
+        ])
+
+    def _chat_rename_channel(self) -> None:
+        if not getattr(self, "_chat_active_channel_id", ""):
+            return
+        current_id = str(self._chat_active_channel_id)
+        current_name = ""
+        # вытащим текущий name из combo (если есть)
+        for i in range(self._chat_channels_combo.count()):
+            if self._chat_channels_combo.itemData(i) == current_id:
+                current_name = self._chat_channels_combo.itemText(i)
+                break
+        name, ok = QtWidgets.QInputDialog.getText(self, "Переименовать канал", "Новое имя канала:", text=current_name)
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            return
+        self._chat_mutate_channels_async([
+            {
+                "type": cluster_pb2.ChatChannelMutationType.CHAT_CHANNEL_RENAME,
+                "channel_id": current_id,
+                "name": name,
+            }
+        ])
+
+    def _chat_delete_channel(self) -> None:
+        if not getattr(self, "_chat_active_channel_id", ""):
+            return
+        current_id = str(self._chat_active_channel_id)
+        if current_id == "general":
+            QtWidgets.QMessageBox.warning(self, "Чат", "Канал general нельзя удалить.")
+            return
+        resp = QtWidgets.QMessageBox.question(self, "Удалить канал", f"Удалить канал '{current_id}'?")
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._chat_mutate_channels_async([
+            {
+                "type": cluster_pb2.ChatChannelMutationType.CHAT_CHANNEL_DELETE,
+                "channel_id": current_id,
+                "name": "",
+            }
+        ])
+
+    def _chat_mutate_channels_async(self, ops: List[dict]) -> None:
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            QtWidgets.QMessageBox.warning(self, "Чат", "Мастер не задан/недоступен")
+            return
+
+        def do_mutate() -> None:
+            try:
+                ch = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
+                req = cluster_pb2.ChatChannelsMutationRequest(
+                    ops=[
+                        cluster_pb2.ChatChannelMutation(
+                            type=o["type"],
+                            channel_id=o["channel_id"],
+                            name=o.get("name") or "",
+                        )
+                        for o in ops
+                    ]
+                )
+                _ = stub.MutateChatChannels(req, timeout=10.0)
+                ch.close()
+            except Exception as e:
+                self.append_log("Ошибка изменения каналов: %s" % e)
+                return
+            # reload
+            self._chat_load_channels()
+
+        threading.Thread(target=do_mutate, daemon=True).start()
+
+    def _chat_on_channel_changed(self) -> None:
+        cid = self._chat_channels_combo.currentData()
+        cid = str(cid or "").strip()
+        if not cid:
+            return
+        self._chat_active_channel_id = cid
+        self._chat_last_seq = 0
+        self._chat_messages = []
+        self._chat_messages_list.clear()
+        self._chat_clear_attachments_panel()
+        self._chat_poll_history(force=True)
+
+    def _chat_clear_attachments_panel(self) -> None:
+        while self._chat_attachments_layout.count():
+            item = self._chat_attachments_layout.takeAt(0)
+            w = item.widget() if item else None
+            if w is not None:
+                w.deleteLater()
+
+    def _chat_sync_workers_checklist(self, workers: Dict[str, dict]) -> None:
+        if not hasattr(self, "_chat_workers_checklist"):
+            return
+        self._chat_workers_checklist.blockSignals(True)
+        self._chat_workers_checklist.clear()
+        for key, w in sorted(workers.items()):
+            # берем только ONLINE для выбора
+            if (w.get("status") or "").upper() != "ONLINE":
+                continue
+            item = QtWidgets.QListWidgetItem(key)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+            self._chat_workers_checklist.addItem(item)
+        self._chat_workers_checklist.blockSignals(False)
+
+    def _chat_add_attachments(self, paths: List[str]) -> None:
+        if not paths:
+            return
+        if len(self._chat_pending_attachments) >= 5:
+            self.append_log("Нельзя добавить больше 5 вложений в одно сообщение")
+            return
+        for p in paths:
+            if len(self._chat_pending_attachments) >= 5:
+                break
+            try:
+                file_path = str(p)
+                if not os.path.isfile(file_path):
+                    continue
+                size = os.path.getsize(file_path)
+                if size > 20 * 1024 * 1024:
+                    self.append_log("Файл слишком большой (20MB max): %s" % os.path.basename(file_path))
+                    continue
+                filename = os.path.basename(file_path)
+                mime_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+                is_image = mime_type.lower().startswith("image/")
+
+                thumb_bytes = b""
+                if is_image:
+                    qimg = QtGui.QImage(file_path)
+                    if not qimg.isNull():
+                        qimg2 = qimg.scaled(
+                            256,
+                            256,
+                            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                            QtCore.Qt.TransformationMode.SmoothTransformation,
+                        )
+                        buf = QtCore.QBuffer()
+                        buf.open(QtCore.QIODevice.OpenModeFlag.ReadWrite)
+                        qimg2.save(buf, "JPEG")
+                        thumb_bytes = bytes(buf.data())
+                        buf.close()
+                    else:
+                        is_image = False
+                        mime_type = "application/octet-stream"
+
+                att = {
+                    "attachment_id": uuid.uuid4().hex,
+                    "path": file_path,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "is_image": bool(is_image),
+                    "size": int(size),
+                    "thumbnail_jpeg": thumb_bytes,
+                }
+                self._chat_pending_attachments.append(att)
+            except Exception as e:
+                self.append_log("Ошибка добавления файла: %s" % e)
+
+        self._chat_selected_files_list.clear()
+        for att in self._chat_pending_attachments:
+            self._chat_selected_files_list.addItem(att.get("filename") or att.get("path") or "file")
+
+    def _chat_pick_files(self) -> None:
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Выберите файлы для чата",
+            "",
+            "All files (*)",
+        )
+        if paths:
+            self._chat_add_attachments(paths)
+
+    def _chat_poll_history(self, force: bool) -> None:
+        if not getattr(self, "_chat_active_channel_id", ""):
+            return
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            return
+
+        since_seq = 0 if force else int(getattr(self, "_chat_last_seq", 0) or 0)
+        channel_id = self._chat_active_channel_id
+
+        def do_fetch() -> None:
+            try:
+                ch = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
+                resp = stub.GetChatHistory(
+                    cluster_pb2.GetChatHistoryRequest(
+                        channel_id=channel_id,
+                        since_seq=since_seq,
+                        limit=200,
+                    ),
+                    timeout=10.0,
+                )
+                ch.close()
+                msgs: List[dict] = []
+                for m in resp.messages or []:
+                    atts: List[dict] = []
+                    for a in m.attachments or []:
+                        atts.append(
+                            {
+                                "attachment_id": a.attachment_id,
+                                "filename": a.filename,
+                                "mime_type": a.mime_type,
+                                "is_image": bool(a.is_image),
+                                "size": int(a.size or 0),
+                                "thumbnail_jpeg": bytes(a.thumbnail_jpeg or b""),
+                            }
+                        )
+                    msgs.append(
+                        {
+                            "message_id": m.message_id,
+                            "seq": int(m.seq or 0),
+                            "timestamp_ms": int(m.timestamp_ms or 0),
+                            "channel_id": m.channel_id,
+                            "sender": m.sender or "",
+                            "text": m.text or "",
+                            "attachments": atts,
+                        }
+                    )
+                payload = {"messages": msgs, "next_seq": int(resp.next_seq or 0)}
+                self.chat_history_received.emit(payload)
+            except Exception as e:
+                # без диалога — чат должен жить даже при временных сетевых проблемах
+                return
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _chat_render_messages(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        msgs = payload.get("messages") or []
+        next_seq = int(payload.get("next_seq") or 0)
+        if not msgs and next_seq == getattr(self, "_chat_last_seq", 0):
+            return
+
+        for m in msgs:
+            text = (m.get("text") or "").strip()
+            sender = m.get("sender") or ""
+            preview = (text[:60] + ("..." if len(text) > 60 else "")) if text else "(без текста)"
+            item = QtWidgets.QListWidgetItem(f"{sender}: {preview}")
+            # иконка для первого изображения
+            icon_pixmap = None
+            for a in m.get("attachments") or []:
+                if a.get("is_image") and a.get("thumbnail_jpeg"):
+                    pm = QtGui.QPixmap()
+                    pm.loadFromData(a["thumbnail_jpeg"], "JPEG")
+                    icon_pixmap = pm
+                    break
+            if icon_pixmap is not None and not icon_pixmap.isNull():
+                item.setIcon(QtGui.QIcon(icon_pixmap))
+            self._chat_messages.append(m)
+            self._chat_messages_list.addItem(item)
+
+        self._chat_last_seq = next_seq
+        # если ещё нет выделения — выделим первый
+        if self._chat_messages_list.currentRow() < 0 and self._chat_messages:
+            self._chat_messages_list.setCurrentRow(0)
+
+    def _chat_on_message_selected(self, row: int) -> None:
+        self._chat_clear_attachments_panel()
+        if row < 0 or row >= len(self._chat_messages):
+            return
+        m = self._chat_messages[row]
+        mid = m.get("message_id") or ""
+        for a in m.get("attachments") or []:
+            att_id = a.get("attachment_id") or ""
+            mime_type = a.get("mime_type") or "application/octet-stream"
+            filename = a.get("filename") or att_id
+            is_image = bool(a.get("is_image") or False)
+            thumb = a.get("thumbnail_jpeg") or b""
+
+            row_w = QtWidgets.QWidget()
+            row_l = QtWidgets.QHBoxLayout()
+            row_l.setContentsMargins(0, 0, 0, 0)
+            label_txt = f"{filename}"
+            label = QtWidgets.QLabel(label_txt)
+            label.setWordWrap(True)
+            row_l.addWidget(label, 1)
+            if is_image and thumb:
+                pm = QtGui.QPixmap()
+                pm.loadFromData(thumb, "JPEG")
+                pm = pm.scaled(80, 80, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+                img_lbl = QtWidgets.QLabel()
+                img_lbl.setPixmap(pm)
+                row_l.addWidget(img_lbl)
+            copy_btn = QtWidgets.QPushButton("Копировать")
+            copy_btn.clicked.connect(lambda _=False, mid=mid, aid=att_id, is_img=is_image, mt=mime_type: self._chat_copy_attachment(mid, aid, is_img, mt))
+            row_l.addWidget(copy_btn)
+            row_w.setLayout(row_l)
+            self._chat_attachments_layout.addWidget(row_w)
+
+    def _chat_copy_attachment(self, message_id: str, attachment_id: str, is_image: bool, mime_type: str) -> None:
+        if not attachment_id:
+            return
+        if attachment_id in self._chat_attachment_cache:
+            data = self._chat_attachment_cache[attachment_id]
+            self._chat_apply_clipboard_data(attachment_id, data, is_image, mime_type)
+            return
+
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            return
+
+        self._chat_send_status.setText("Копирование...")
+
+        def do_copy() -> None:
+            try:
+                ch = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
+                stream = stub.GetChatAttachment(
+                    cluster_pb2.GetChatAttachmentRequest(message_id=message_id, attachment_id=attachment_id),
+                    timeout=600.0,
+                )
+                buf = bytearray()
+                for c in stream:
+                    if c.data:
+                        buf.extend(c.data)
+                    if c.is_last:
+                        break
+                ch.close()
+                data = bytes(buf)
+                self._chat_attachment_cache[attachment_id] = data
+                self._chat_apply_clipboard_from_thread(data, is_image, mime_type)
+            except Exception as e:  # noqa: BLE001
+                self.append_log("Ошибка копирования: %s" % e)
+
+        threading.Thread(target=do_copy, daemon=True).start()
+
+    def _chat_apply_clipboard_from_thread(self, data: bytes, is_image: bool, mime_type: str) -> None:
+        if is_image:
+            img = QtGui.QImage.fromData(data)
+            if img.isNull():
+                self.append_log("Не удалось распознать изображение для clipboard")
+                return
+            self.chat_clipboard_set_image.emit(img)
+        else:
+            b64 = base64.b64encode(data).decode("ascii")
+            prefix = mime_type or "application/octet-stream"
+            self.chat_clipboard_set_text.emit(f"data:{prefix};base64,{b64}")
+
+    def _chat_apply_clipboard_data(self, attachment_id: str, data: bytes, is_image: bool, mime_type: str) -> None:
+        # используется только из кэша (в GUI потоке)
+        self._chat_apply_clipboard_from_thread(data, is_image, mime_type)
+
+    def _chat_set_clipboard_text(self, text: str) -> None:
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._chat_send_status.setText("Готово")
+
+    def _chat_set_clipboard_image(self, img: object) -> None:
+        # img как QtGui.QImage
+        try:
+            QtWidgets.QApplication.clipboard().setImage(img)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        self._chat_send_status.setText("Готово")
+
+    def _chat_on_send_finished(self, ok: bool, error: str) -> None:
+        # универсальный хук: ок/ошибка для отправки и для копирования.
+        self._chat_send_btn.setEnabled(True)
+        if ok:
+            if error:
+                self.append_log(error)
+        else:
+            if error:
+                self.append_log(error)
+        if not ok and error:
+            QtWidgets.QMessageBox.warning(self, "Чат", error)
+
+    def _chat_send_message(self) -> None:
+        if not getattr(self, "_chat_pending_attachments", None):
+            self._chat_pending_attachments = []
+
+        channel_id = str(self._chat_channels_combo.currentData() or "").strip()
+        if not channel_id:
+            QtWidgets.QMessageBox.warning(self, "Чат", "Выберите канал")
+            return
+
+        target_keys: List[str] = []
+        for i in range(self._chat_workers_checklist.count()):
+            item = self._chat_workers_checklist.item(i)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                key = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if key:
+                    target_keys.append(str(key))
+        if not target_keys:
+            QtWidgets.QMessageBox.warning(self, "Чат", "Выберите хотя бы одного получателя (воркер ONLINE).")
+            return
+
+        text = (self._chat_text_edit.toPlainText() or "").strip()
+
+        # сбор заголовка и метаданных вложений
+        attachments_meta: List[cluster_pb2.ChatPostAttachmentMeta] = []
+        for att in self._chat_pending_attachments[:5]:
+            thumb = att.get("thumbnail_jpeg") or b""
+            attachments_meta.append(
+                cluster_pb2.ChatPostAttachmentMeta(
+                    attachment_id=att["attachment_id"],
+                    filename=att.get("filename") or "file",
+                    mime_type=att.get("mime_type") or "application/octet-stream",
+                    is_image=bool(att.get("is_image") or False),
+                    size=int(att.get("size") or 0),
+                    thumbnail_jpeg=thumb if bool(att.get("is_image") or False) else b"",
+                )
+            )
+
+        message_id = uuid.uuid4().hex
+        timestamp_ms = int(time.time() * 1000)
+        sender = os.environ.get("COMPUTERNAME") or "gui"
+
+        header = cluster_pb2.ChatPostHeader(
+            message_id=message_id,
+            timestamp_ms=timestamp_ms,
+            channel_id=channel_id,
+            sender=sender,
+            text=text,
+            target_worker_keys=target_keys,
+            attachments=attachments_meta,
+        )
+
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            QtWidgets.QMessageBox.warning(self, "Чат", "Мастер не задан/недоступен")
+            return
+
+        self._chat_send_btn.setEnabled(False)
+        self._chat_send_status.setText("Отправка...")
+
+        def gen() -> Any:
+            yield cluster_pb2.ChatPostChunk(header=header)
+            CHUNK = 256 * 1024
+            for att in self._chat_pending_attachments[:5]:
+                path = att.get("path")
+                aid = att.get("attachment_id")
+                if not path or not aid:
+                    continue
+                with open(path, "rb") as f:
+                    b = f.read(CHUNK)
+                    if not b:
+                        # Нулевой размер: всё равно нужно отправить один чанкуемый блок.
+                        yield cluster_pb2.ChatPostChunk(
+                            attachment_chunk=cluster_pb2.ChatPostAttachmentChunk(
+                                attachment_id=aid,
+                                data=b"",
+                                is_last=True,
+                            )
+                        )
+                        continue
+                    while b:
+                        b2 = f.read(CHUNK)
+                        is_last = b2 == b""
+                        yield cluster_pb2.ChatPostChunk(
+                            attachment_chunk=cluster_pb2.ChatPostAttachmentChunk(
+                                attachment_id=aid,
+                                data=b,
+                                is_last=is_last,
+                            )
+                        )
+                        b = b2
+
+        def do_send() -> None:
+            try:
+                ch = grpc.insecure_channel(addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
+                resp = stub.PostChatMessage(gen(), timeout=600.0)
+                ch.close()
+                if resp.ok:
+                    # очистка ввода в GUI потоке
+                    self._chat_text_edit.setPlainText("")
+                    self._chat_pending_attachments = []
+                    self._chat_selected_files_list.clear()
+                    self._chat_send_status.setText("Отправлено")
+                    # обновить чат
+                    self._chat_poll_history(force=False)
+                    self.chat_send_finished.emit(True, "")
+                else:
+                    self.chat_send_finished.emit(False, resp.error or "Ошибка отправки")
+            except Exception as e:  # noqa: BLE001
+                self.chat_send_finished.emit(False, str(e))
+
+        threading.Thread(target=do_send, daemon=True).start()
+
+    # end chat
 
 
 class WorkerTableModel(QtCore.QAbstractTableModel):

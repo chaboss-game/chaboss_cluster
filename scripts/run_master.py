@@ -10,6 +10,7 @@ from pathlib import Path
 import grpc
 
 from cluster_core.common.config import load_master_config, WorkerConfig
+from cluster_core.common.log_buffer import LogBuffer, make_buffer_handler
 from cluster_core.master.worker_registry import WorkerRegistry
 from cluster_core.master.master_node import MasterNode
 from cluster_core.master.admin_service import MasterAdminService
@@ -41,7 +42,13 @@ def main() -> None:
         config_path = config_path.resolve()
     cfg = load_master_config(config_path)
 
-    logging.basicConfig(level=logging.INFO)
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    log_buffer = LogBuffer(max_lines=2000)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(make_buffer_handler(log_buffer, fmt))
+    logging.basicConfig(level=logging.INFO, format=fmt)
     logger = logging.getLogger("master")
 
     # Если мастер запущен из GUI, даём приоритет настройкам автосейва (workers, режим загрузки, ресурсы).
@@ -82,7 +89,7 @@ def main() -> None:
     logger.info("Config loaded from %s (%d workers)", config_path, len(cfg.workers))
 
     registry = WorkerRegistry()
-    master_node = MasterNode(cfg, registry)
+    master_node = MasterNode(cfg, registry, log_buffer=log_buffer)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     cluster_pb2_grpc.add_MasterAdminServiceServicer_to_server(

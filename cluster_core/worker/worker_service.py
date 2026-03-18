@@ -12,6 +12,7 @@ import threading
 import time
 import sys
 import os
+import base64
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
@@ -21,6 +22,7 @@ import torch.nn as nn
 
 from cluster_core.common.tensor_io import payload_to_tensor, tensor_to_payload
 from cluster_core.common.types import GpuInfo, ResourceInfo, WorkerDescriptor, WorkerId, WorkerStatus
+from cluster_core.common.chat_storage import ChatStorage, StoredChatAttachment
 from cluster_core.grpc import cluster_pb2, cluster_pb2_grpc
 
 logger = logging.getLogger("worker.service")
@@ -374,7 +376,13 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
     HealthStream, RunStage (forward по модулю или identity).
     """
 
-    def __init__(self, host: str, port: int, auth_token: str | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        auth_token: str | None = None,
+        log_buffer: Any = None,
+    ) -> None:
         super().__init__()
         self._host = host
         self._port = port
@@ -384,10 +392,15 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         self._resources = _detect_resources()
         self._shards: Dict[str, Dict[str, Any]] = {}  # shard_id -> state_dict chunk
         self._shard_modules: Dict[str, nn.Module] = {}  # shard_id -> nn.Module (BERT layers и т.д.)
-        # streaming_chunks: храним только путь к кэшу HF и диапазон слоёв; веса подгружаются по мере надобности.
         self._stream_plans: Dict[str, Dict[str, Any]] = {}  # module_key -> {path, model_id, start, end}
         self._load_progress_lock = threading.Lock()
-        self._load_progress: Dict[str, Any] | None = None  # во время InitShard (HF): stage, percent, bytes_*
+        self._load_progress: Dict[str, Any] | None = None
+        self._log_buffer = log_buffer  # для GetWorkerLogs (буфер из run_worker)
+
+        # Чат: история и вложения в ./cluster_shared/
+        project_root = Path(__file__).resolve().parents[2]
+        shared_root = project_root / "cluster_shared"
+        self._chat_storage = ChatStorage(shared_root, cache_messages=500)
 
     # Helpers to convert internal dataclasses -> protobuf messages.
 
@@ -751,6 +764,129 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 return cluster_pb2.RemoteUpdateResponse(ok=False, error=f"GUI restart failed: {e}", output=output)
 
         return cluster_pb2.RemoteUpdateResponse(ok=True, error="", output=output)
+
+    def GetWorkerLogs(
+        self,
+        request: cluster_pb2.GetWorkerLogsRequest,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.GetWorkerLogsResponse:
+        """Отдаёт последние строки из буфера логов воркера (то же, что пишется в logs/worker.log)."""
+        since = max(0, getattr(request, "since_index", 0) or 0)
+        if self._log_buffer is None:
+            return cluster_pb2.GetWorkerLogsResponse(lines=[], next_index=0)
+        lines, next_index = self._log_buffer.get_since(since)
+        return cluster_pb2.GetWorkerLogsResponse(lines=lines, next_index=next_index)
+
+    def ReceiveChatMessage(
+        self,
+        request_iterator: Iterator[cluster_pb2.ChatPostChunk],
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.ReceiveChatMessageResponse:
+        """
+        Client-streaming: мастер отправляет header + чанки вложений.
+        Идемпотентность: если message_id уже сохранён — повторно не пишем.
+        """
+        header: cluster_pb2.ChatPostHeader | None = None
+        attachments_meta: list[cluster_pb2.ChatPostAttachmentMeta] = []
+
+        tmp_fds: Dict[str, Any] = {}
+        bytes_received: Dict[str, int] = {}
+        is_last_seen: Dict[str, bool] = {}
+        skip_store = False
+
+        try:
+            for chunk in request_iterator:
+                which = chunk.WhichOneof("payload")
+                if which == "header":
+                    header = chunk.header
+                    attachments_meta = list(header.attachments or [])
+                    if not header.message_id:
+                        return cluster_pb2.ReceiveChatMessageResponse(ok=False, error="message_id обязателен.", message_id="")
+                    # Идемпотентность можно включать после header.
+                    skip_store = self._chat_storage.has_received_message(header.message_id)
+
+                    if not skip_store:
+                        # открываем tmp-файлы под вложения
+                        for a in attachments_meta:
+                            if a.size > 20 * 1024 * 1024:
+                                return cluster_pb2.ReceiveChatMessageResponse(ok=False, error="Слишком большой файл.", message_id=header.message_id)
+                            orig_path = self._chat_storage.attachment_original_path(a.attachment_id)
+                            tmp_path = orig_path.with_suffix(".tmp")
+                            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                            tmp_fds[a.attachment_id] = tmp_path.open("wb")
+                            bytes_received[a.attachment_id] = 0
+                            is_last_seen[a.attachment_id] = False
+
+                elif which == "attachment_chunk":
+                    if header is None:
+                        return cluster_pb2.ReceiveChatMessageResponse(ok=False, error="Сначала должен прийти header.", message_id="")
+                    ac = chunk.attachment_chunk
+                    aid = str(ac.attachment_id or "").strip()
+                    if skip_store:
+                        continue
+                    if not aid or aid not in tmp_fds:
+                        continue
+                    data = ac.data or b""
+                    tmp_fds[aid].write(data)
+                    bytes_received[aid] += len(data)
+                    is_last_seen[aid] = bool(is_last_seen.get(aid, False) or ac.is_last)
+
+                else:
+                    continue
+        except Exception as e:  # noqa: BLE001
+            return cluster_pb2.ReceiveChatMessageResponse(ok=False, error=str(e), message_id=header.message_id if header else "")
+
+        if header is None:
+            return cluster_pb2.ReceiveChatMessageResponse(ok=False, error="Header не получен.", message_id="")
+
+        try:
+            if skip_store:
+                return cluster_pb2.ReceiveChatMessageResponse(ok=True, error="", message_id=header.message_id)
+
+            # close + rename temp files
+            for aid, fd in tmp_fds.items():
+                fd.flush()
+                fd.close()
+                orig_path = self._chat_storage.attachment_original_path(aid)
+                tmp_path = orig_path.with_suffix(".tmp")
+                tmp_path.replace(orig_path)
+
+            for a in attachments_meta:
+                if not is_last_seen.get(a.attachment_id, False):
+                    return cluster_pb2.ReceiveChatMessageResponse(ok=False, error=f"Не получены все чанки для {a.filename}", message_id=header.message_id)
+
+            # thumbnails + record attachments
+            attachments_for_record: list[StoredChatAttachment] = []
+            for a in attachments_meta:
+                thumb_bytes = bytes(a.thumbnail_jpeg or b"")
+                if a.is_image and thumb_bytes:
+                    self._chat_storage.write_thumbnail_bytes(a.attachment_id, thumb_bytes)
+                    thumb_b64 = base64.b64encode(thumb_bytes).decode("ascii")
+                else:
+                    thumb_b64 = None
+                attachments_for_record.append(
+                    StoredChatAttachment(
+                        attachment_id=a.attachment_id,
+                        filename=a.filename,
+                        mime_type=a.mime_type,
+                        is_image=bool(a.is_image),
+                        size=int(a.size or 0),
+                        thumbnail_jpeg_b64=thumb_b64,
+                    )
+                )
+
+            self._chat_storage.append_message(
+                message_id=header.message_id,
+                timestamp_ms=int(header.timestamp_ms or 0),
+                channel_id=header.channel_id,
+                sender=header.sender or "",
+                text=header.text or "",
+                attachments=attachments_for_record,
+            )
+            self._chat_storage.save_received_marker(header.message_id)
+            return cluster_pb2.ReceiveChatMessageResponse(ok=True, error="", message_id=header.message_id)
+        except Exception as e:  # noqa: BLE001
+            return cluster_pb2.ReceiveChatMessageResponse(ok=False, error=str(e), message_id=header.message_id)
 
     def _restart_gui(self, project_root: Path, start_worker: bool) -> None:
         """

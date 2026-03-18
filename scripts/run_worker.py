@@ -9,6 +9,7 @@ from pathlib import Path
 import grpc
 
 from cluster_core.common.config import load_worker_config
+from cluster_core.common.log_buffer import LogBuffer, make_buffer_handler
 from cluster_core.worker.worker_service import WorkerService
 
 
@@ -31,6 +32,10 @@ def main() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers.clear()
+
+    log_buffer = LogBuffer(max_lines=2000)
+    root.addHandler(make_buffer_handler(log_buffer, fmt))
+
     try:
         project_root = Path(__file__).resolve().parent.parent
         log_dir = project_root / "logs"
@@ -76,7 +81,7 @@ def main() -> None:
         options=server_options,
     )
 
-    worker_service = WorkerService(host=host, port=port, auth_token=auth_token)
+    worker_service = WorkerService(host=host, port=port, auth_token=auth_token, log_buffer=log_buffer)
     from cluster_core.grpc import cluster_pb2_grpc
 
     cluster_pb2_grpc.add_WorkerServiceServicer_to_server(worker_service, server)

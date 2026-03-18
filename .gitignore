@@ -7,6 +7,11 @@ config/master.yaml
 # Логи воркера (scripts/run_worker.py)
 logs/
 
+# Общий кластерный обмен (история чата, вложения, кэши).
+# Не коммитим, чтобы git pull не конфликтовал.
+cluster_shared/
+cluster_shared/**
+
 # Временные/автосейв файлы конфигов (редакторы)
 config/*.yaml~
 config/*.yml~

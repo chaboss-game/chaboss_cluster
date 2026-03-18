@@ -10,7 +10,8 @@ import threading
 import time
 import uuid
 import hashlib
-from typing import Dict, List
+from pathlib import Path
+from typing import Any, Dict, List
 
 import grpc
 
@@ -19,6 +20,7 @@ from cluster_core.common.tensor_io import payload_to_tensor, tensor_to_payload
 from cluster_core.common.types import GpuInfo, ResourceInfo, WorkerDescriptor, WorkerId, WorkerStatus
 from cluster_core.master.worker_registry import WorkerRegistry
 from cluster_core.grpc import cluster_pb2, cluster_pb2_grpc
+from cluster_core.common.chat_storage import ChatStorage
 
 
 logger = logging.getLogger("master.node")
@@ -88,7 +90,7 @@ class MasterNode:
     При обрыве: статус RECONNECTING, backoff, переподключение и при успехе — снова ONLINE.
     """
 
-    def __init__(self, cfg: MasterConfig, registry: WorkerRegistry) -> None:
+    def __init__(self, cfg: MasterConfig, registry: WorkerRegistry, log_buffer: Any = None) -> None:
         self._cfg = cfg
         self._registry = registry
         self._lock = threading.RLock()
@@ -98,9 +100,14 @@ class MasterNode:
         self._stop_event = threading.Event()
         self._last_loaded_model_id: str | None = None
         self._last_loaded_shard_ids: List[str] = []
-        # Число подряд неудачных переподключений; RECONNECTING показываем только после N подряд.
         self._reconnect_failures: Dict[str, int] = {}
         self._reconnect_failures_before_status = 2
+        self._log_buffer = log_buffer  # для GetClusterLogs (буфер из run_master)
+
+        # Чат: история и вложения в ./cluster_shared/
+        project_root = Path(__file__).resolve().parents[2]
+        shared_root = project_root / "cluster_shared"
+        self._chat_storage = ChatStorage(shared_root, cache_messages=2000)
 
     def start_background(self) -> None:
         """Старт: первичное подключение к воркерам и поток HealthStream для каждого из конфига."""
@@ -633,6 +640,108 @@ class MasterNode:
 
         ok = len(errors) == 0
         return ok, "; ".join(errors), results
+
+    def get_cluster_logs(
+        self,
+        master_since: int,
+        worker_since: Dict[str, int],
+    ) -> cluster_pb2.GetClusterLogsResponse:
+        """Собирает логи мастера и воркеров для отображения в GUI."""
+        resp = cluster_pb2.GetClusterLogsResponse(master_next=master_since, worker_logs={})
+        if self._log_buffer is not None:
+            lines, next_idx = self._log_buffer.get_since(master_since)
+            resp.master_lines.extend(lines)
+            resp.master_next = next_idx
+        with self._lock:
+            stubs_snapshot = dict(self._stubs)
+        for key, stub in stubs_snapshot.items():
+            since = worker_since.get(key, 0)
+            try:
+                r = stub.GetWorkerLogs(
+                    cluster_pb2.GetWorkerLogsRequest(since_index=since),
+                    timeout=5.0,
+                )
+                chunk = cluster_pb2.WorkerLogsChunk(lines=list(r.lines), next_index=r.next_index)
+                resp.worker_logs[key] = chunk
+            except Exception:  # noqa: BLE001
+                pass
+        return resp
+
+    def forward_chat_message_to_workers(
+        self,
+        header: cluster_pb2.ChatPostHeader,
+        attachments: List[cluster_pb2.ChatPostAttachmentMeta],
+    ) -> None:
+        """
+        Best-effort: переслать сообщение и вложения выбранным воркерам.
+        Не блокируем UI: запускаем в фоне.
+        """
+        target_keys = list(header.target_worker_keys)
+        if not target_keys:
+            return
+
+        def run() -> None:
+            for worker_key in target_keys:
+                stub = None
+                with self._lock:
+                    stub = self._stubs.get(worker_key)
+                if stub is None:
+                    continue
+
+                def gen() -> Any:
+                    # Заголовок (мастер отправляет и на воркер, тот же формат)
+                    h = cluster_pb2.ChatPostHeader(
+                        message_id=header.message_id,
+                        timestamp_ms=header.timestamp_ms,
+                        channel_id=header.channel_id,
+                        sender=header.sender,
+                        text=header.text,
+                        target_worker_keys=[],  # на воркере не используется
+                        attachments=list(attachments),
+                    )
+                    yield cluster_pb2.ChatPostChunk(header=h)
+
+                    CHUNK = 256 * 1024
+                    for a in attachments:
+                        path = self._chat_storage.attachment_original_path(a.attachment_id)
+                        try:
+                            with path.open("rb") as f:
+                                while True:
+                                    b = f.read(CHUNK)
+                                    if not b:
+                                        break
+                                    is_last = False
+                                    # узнаём last через peek на размер следующего чанка
+                                    # чтобы не читать лишнее — читаем один раз дальше.
+                                    # (практически это доп. чтение на 1 чанку максимум)
+                                    next_pos = f.tell()
+                                    b2 = f.read(1)
+                                    if b2 == b"":
+                                        # на самом деле EOF
+                                        is_last = True
+                                        # вернуть обратно 0 байт не нужно
+                                    else:
+                                        # если есть следующий байт — переносим позицию назад
+                                        f.seek(next_pos)
+                                    yield cluster_pb2.ChatPostChunk(
+                                        attachment_chunk=cluster_pb2.ChatPostAttachmentChunk(
+                                            attachment_id=a.attachment_id,
+                                            data=b,
+                                            is_last=is_last,
+                                        )
+                                    )
+                        except FileNotFoundError:
+                            # Если файла нет — пропускаем, воркер получит ошибку по метаданным.
+                            continue
+
+                try:
+                    # client-streaming -> unary response
+                    stub.ReceiveChatMessage(gen(), timeout=300.0)
+                except Exception:
+                    # Best-effort: не ломаем master при проблемах пересылки.
+                    continue
+
+        threading.Thread(target=run, daemon=True).start()
 
     def run_pipeline(self, input_tensor: "torch.Tensor") -> "torch.Tensor":
         """
