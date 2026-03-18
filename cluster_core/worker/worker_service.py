@@ -10,6 +10,7 @@ import psutil
 import threading
 import time
 import sys
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
@@ -628,24 +629,28 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
 
     def _restart_gui(self, project_root: Path, start_worker: bool) -> None:
         """
-        Best-effort: если найден процесс GUI, останавливает его и запускает новый.
+        Best-effort: если найден PID-файл GUI — останавливает процесс и запускает новый.
+        Если GUI не запущен (PID-файла нет) — ничего не делает.
         Запуск: python -m ui.main_window [--start-worker]
         """
-        # Найдём процессы python, запущенные как "ui.main_window"
-        gui_pids: list[int] = []
-        for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
-            try:
-                cmdline = " ".join(p.info.get("cmdline") or [])
-            except Exception:
-                continue
-            if "ui.main_window" in cmdline and "-m" in cmdline:
-                gui_pids.append(int(p.info["pid"]))
-
-        for pid in gui_pids:
+        pid_file = project_root / ".chaboss_gui.pid"
+        if not pid_file.exists():
+            return
+        try:
+            pid_txt = pid_file.read_text(encoding="utf-8").strip()
+            pid = int(pid_txt)
+        except Exception:
+            pid = 0
+        if pid > 0:
             try:
                 psutil.Process(pid).terminate()
             except Exception:
                 pass
+
+        # В headless-окружении GUI не стартуем.
+        if platform.system().lower() == "linux":
+            if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+                return
 
         args = [sys.executable, "-m", "ui.main_window"]
         if start_worker:

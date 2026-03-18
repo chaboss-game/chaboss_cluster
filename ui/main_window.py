@@ -1183,16 +1183,40 @@ class WorkerTableModel(QtCore.QAbstractTableModel):
 
 def main() -> None:
     import argparse
+    import atexit
+    from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Chaboss Cluster GUI")
     parser.add_argument("--start-worker", action="store_true", help="Автоматически запустить воркера при старте GUI")
     args, _ = parser.parse_known_args()
+
+    project_root = Path(__file__).resolve().parents[1]  # .../chaboss_cluster
+    pid_file = project_root / ".chaboss_gui.pid"
+
+    def write_pid() -> None:
+        try:
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        except Exception:
+            pass
+
+    def cleanup_pid() -> None:
+        try:
+            if pid_file.exists():
+                # Удаляем только если PID наш (защита от гонок).
+                cur = pid_file.read_text(encoding="utf-8").strip()
+                if cur == str(os.getpid()):
+                    pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     app = QtWidgets.QApplication(sys.argv)
     master_addr = (os.environ.get("CLUSTER_MASTER_ADDR") or "").strip() or None
     win = MainWindow(master_addr=master_addr)
     win.resize(900, 500)
     win.show()
+    write_pid()
+    app.aboutToQuit.connect(cleanup_pid)
+    atexit.register(cleanup_pid)
     if args.start_worker:
         # Запуск после показа окна, чтобы UI успел инициализироваться.
         QtCore.QTimer.singleShot(0, win._on_start_worker)
