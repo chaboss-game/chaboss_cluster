@@ -822,6 +822,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         msg = f"{r.worker}: ok"
                     else:
                         msg = f"{r.worker}: ошибка: {r.error}"
+                        err_lower = (r.error or "").lower()
+                        if "method not found" in err_lower or "unimplemented" in err_lower:
+                            msg += "\n  → На этой машине воркер запущен со старой версией. Остановите воркер, сделайте git pull и перезапустите воркер вручную."
                     if r.output:
                         out = r.output.strip().replace("\r\n", "\n")
                         if len(out) > 400:
