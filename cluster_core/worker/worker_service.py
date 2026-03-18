@@ -628,6 +628,15 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         project_root = Path(__file__).resolve().parents[2]  # .../chaboss_cluster
         git_remote = (request.git_remote or "origin").strip() or "origin"
         git_branch = (request.git_branch or "").strip()
+
+        # Убираем PID-файл до pull, иначе git откажет: "untracked working tree files would be overwritten by merge"
+        pid_file = project_root / ".chaboss_gui.pid"
+        if pid_file.exists():
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
+
         cmd = ["git", "pull", "--rebase", "--autostash", git_remote]
         if git_branch:
             cmd.append(git_branch)
