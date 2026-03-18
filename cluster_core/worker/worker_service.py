@@ -30,6 +30,14 @@ _LAYER_PREFIX_RE_GPT2 = re.compile(r"^transformer\.h\.(\d+)\.")
 _LAYER_PREFIX_RE_LLAMA = re.compile(r"^model\.layers\.(\d+)\.")
 
 
+def _load_state_dict_into(module: nn.Module, state_dict: dict, strict: bool = False) -> None:
+    """Загружает state_dict в модуль; при возможности с assign=True (PyTorch 2+) — без копирования, пик памяти 1x."""
+    try:
+        module.load_state_dict(state_dict, strict=strict, assign=True)
+    except TypeError:
+        module.load_state_dict(state_dict, strict=strict)
+
+
 def _layer_indices_from_state_dict(state_dict: dict) -> List[int]:
     """Возвращает отсортированный список индексов слоёв по ключам state_dict."""
     indices = set()
@@ -62,7 +70,7 @@ def _try_build_bert_layers_module(model_id: str, state_dict: dict) -> nn.Module 
             prefix_full = f"{prefix}{idx}."
             sub = {k[len(prefix_full) :]: v for k, v in state_dict.items() if k.startswith(prefix_full)}
             if sub:
-                layer.load_state_dict(sub, strict=False)
+                _load_state_dict_into(layer, sub)
                 loaded = True
                 break
         if not loaded:
@@ -106,7 +114,7 @@ def _try_build_gpt2_layers_module(model_id: str, state_dict: dict) -> nn.Module 
         if not sub:
             return None
         layer = GPT2Block(config)
-        layer.load_state_dict(sub, strict=False)
+        _load_state_dict_into(layer, sub)
         layer.eval()
         layers.append(layer)
     return nn.Sequential(*layers)
@@ -149,7 +157,7 @@ def _try_build_llama_layers_module(model_id: str, state_dict: dict) -> nn.Module
         if not sub:
             return None
         layer = LlamaDecoderLayer(config)
-        layer.load_state_dict(sub, strict=False)
+        _load_state_dict_into(layer, sub)
         layer.eval()
         layers.append(layer)
     return nn.Sequential(*layers)
@@ -187,7 +195,7 @@ def _try_build_qwen2_layers_module(model_id: str, state_dict: dict) -> nn.Module
         if not sub:
             return None
         layer = Qwen2DecoderLayer(config)
-        layer.load_state_dict(sub, strict=False)
+        _load_state_dict_into(layer, sub)
         layer.eval()
         layers.append(layer)
     return nn.Sequential(*layers)
@@ -399,15 +407,23 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     if not isinstance(state_dict, dict):
                         return cluster_pb2.InitShardResponse(ok=False, error="Ожидался state_dict (dict)")
                     logger.info("state_dict загружен из blob, ключей=%d", len(state_dict))
-                self._shards[shard_id] = state_dict
                 if state_dict and spec.model_id:
                     logger.info("Сборка модуля слоёв для model_id=%s...", spec.model_id)
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
+                        self._shards[shard_id] = {}
+                        del state_dict
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         logger.info("Модуль слоёв собран успешно")
                     else:
+                        self._shards[shard_id] = state_dict
                         logger.info("Модуль слоёв не собран (будут только веса)")
+                else:
+                    self._shards[shard_id] = state_dict
                 elapsed = time.perf_counter() - t0
                 logger.info(
                     "Ответ мастеру: чанк загружен успешно, размер=%d байт, время=%.2f с",
@@ -422,13 +438,23 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 )
                 if not isinstance(state_dict, dict):
                     return cluster_pb2.InitShardResponse(ok=False, error="Ожидался state_dict (dict)")
-                self._shards[shard_id] = state_dict
+                num_keys = len(state_dict)
                 if state_dict and spec.model_id:
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
+                        self._shards[shard_id] = {}
+                        del state_dict
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        self._shards[shard_id] = state_dict
+                else:
+                    self._shards[shard_id] = state_dict
                 elapsed = time.perf_counter() - t0
-                logger.info("Ответ мастеру: шард из shared_path загружен, ключей=%d, время=%.2f с", len(state_dict), elapsed)
+                logger.info("Ответ мастеру: шард из shared_path загружен, ключей=%d, время=%.2f с", num_keys, elapsed)
             elif request.weight_source == "hf" and request.hf_model_name:
                 logger.info("Получена команда скачать модель с HF: %s", request.hf_model_name)
                 try:
@@ -478,15 +504,27 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 except Exception:
                     approx_bytes = 0
 
-                self._shards[shard_id] = state_dict
+                num_keys = len(state_dict)
                 if state_dict and spec.model_id:
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         self._shard_modules[shard_id] = module
+                        # Не держим state_dict в _shards — модуль уже содержит веса.
+                        # Иначе пик памяти 2x (state_dict + модуль) и на Windows срабатывает os error 1455.
+                        self._shards[shard_id] = {}
+                        del state_dict
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        self._shards[shard_id] = state_dict
+                else:
+                    self._shards[shard_id] = state_dict
                 elapsed = time.perf_counter() - t0
                 logger.info(
                     "Ответ мастеру: HF->шард загружен на воркере, ключей=%d, ~%.1f МБ, время=%.2f с",
-                    len(state_dict),
+                    num_keys,
                     approx_bytes / (1024 * 1024) if approx_bytes else 0.0,
                     elapsed,
                 )
@@ -758,7 +796,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             if layer is None:
                 from transformers import LlamaDecoderLayer
                 layer = LlamaDecoderLayer(cfg)
-            layer.load_state_dict(layer_sd, strict=False)
+            _load_state_dict_into(layer, layer_sd)
             layer.eval()
             return layer
 
