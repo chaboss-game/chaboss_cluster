@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import re
-from typing import Callable
+from typing import Callable, Iterable
 
 logger = logging.getLogger("cluster.hf_download")
 
@@ -111,10 +111,15 @@ def _fmt_size(n: int) -> str:
     return f"{n} B"
 
 
-def load_state_dict_from_dir(path: pathlib.Path | str, model_id: str = ""):
+def load_state_dict_from_dir(
+    path: pathlib.Path | str,
+    model_id: str = "",
+    keys: Iterable[str] | None = None,
+):
     """
     Загружает state_dict из директории (pytorch_model.bin / model.safetensors / *.safetensors).
     Возвращает dict. model_id используется только для fallback через transformers.
+    Если передан keys — пытается загрузить только указанные тензоры (эффективно для больших моделей).
     """
     import torch
     path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
@@ -125,18 +130,38 @@ def load_state_dict_from_dir(path: pathlib.Path | str, model_id: str = ""):
             state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
     elif (path / "model.safetensors").exists():
         try:
-            from safetensors.torch import load_file
-            state_dict = load_file(str(path / "model.safetensors"))
+            from safetensors import safe_open
+            # Если keys задан, читаем только нужные тензоры без загрузки всей модели в RAM.
+            if keys is not None:
+                want = set(keys)
+                state_dict = {}
+                with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        if k in want:
+                            state_dict[k] = f.get_tensor(k)
+                # Если в этом файле ничего не нашли — оставим пустой dict, дальше не падаем.
+            else:
+                from safetensors.torch import load_file
+                state_dict = load_file(str(path / "model.safetensors"))
         except ImportError:
             raise RuntimeError("Установите safetensors: pip install safetensors")
     if state_dict is None:
         st_files = list(path.glob("*.safetensors"))
         if st_files:
             try:
-                from safetensors.torch import load_file
+                from safetensors import safe_open
                 state_dict = {}
-                for f in st_files:
-                    state_dict.update(load_file(str(f)))
+                want = set(keys) if keys is not None else None
+                for sf in st_files:
+                    if want is None:
+                        from safetensors.torch import load_file
+                        state_dict.update(load_file(str(sf)))
+                        continue
+                    with safe_open(str(sf), framework="pt", device="cpu") as f:
+                        # Итерируем ключи файла (без загрузки тензоров) и забираем только нужные.
+                        for k in f.keys():
+                            if k in want:
+                                state_dict[k] = f.get_tensor(k)
             except ImportError:
                 raise RuntimeError("Установите safetensors: pip install safetensors")
         else:
@@ -145,6 +170,13 @@ def load_state_dict_from_dir(path: pathlib.Path | str, model_id: str = ""):
                 state_dict = torch.load(bin_files[0], map_location="cpu", weights_only=True)
                 if not isinstance(state_dict, dict):
                     state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
+    if state_dict is not None and keys is not None:
+        # Для .bin (и некоторых нетипичных случаев) всё равно могло загрузиться много — фильтруем.
+        want = set(keys)
+        if not isinstance(state_dict, dict):
+            raise TypeError("Ожидался state_dict (dict)")
+        state_dict = {k: v for k, v in state_dict.items() if k in want}
+
     if state_dict is None and model_id:
         try:
             from transformers import AutoModel

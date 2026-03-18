@@ -451,21 +451,18 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                         progress_callback=on_progress,
                     )
                     logger.info("Артефакты модели скачаны в кэш: %s", path)
-                    state_dict = load_state_dict_from_dir(path, request.hf_model_name)
+                    shard_keys = list(request.shard_keys) if request.shard_keys else []
+                    if shard_keys:
+                        logger.info("Получены metки шарда (keys=%d). Загружаем только нужные тензоры...", len(shard_keys))
+                    state_dict = load_state_dict_from_dir(path, request.hf_model_name, keys=shard_keys or None)
                 finally:
                     with self._load_progress_lock:
                         self._load_progress = None
 
                 logger.info("state_dict загружен из кэша HF, ключей=%d", len(state_dict))
 
-                # Если мастер прислал список ключей шарда — оставляем только их.
-                shard_keys = list(request.shard_keys) if request.shard_keys else []
-                if shard_keys:
-                    logger.info("Получены метки шарда (keys=%d). Фильтрация state_dict...", len(shard_keys))
-                    filtered = {k: state_dict.get(k) for k in shard_keys if k in state_dict}
-                    missing = len(shard_keys) - len(filtered)
-                    state_dict = filtered
-                    logger.info("Фильтрация завершена: keys=%d (missing=%d)", len(state_dict), missing)
+                # На больших моделях важно не держать полный state_dict в памяти.
+                # load_state_dict_from_dir(keys=...) уже загружает только нужные ключи (для safetensors).
 
                 approx_bytes = 0
                 try:

@@ -902,18 +902,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 "(обычно ~/.cache/huggingface или %USERPROFILE%\\.cache\\huggingface на Windows). "
                 "Либо задайте другую папку через переменную окружения HF_HOME / HUGGINGFACE_HUB_CACHE на воркере.\n\n"
             )
+        swap_hint = ""
+        if "os error 1455" in error or "Файл подкачки" in error or "pagefile" in error.lower():
+            swap_hint = (
+                "• На Windows не хватает файла подкачки (os error 1455). Увеличьте размер файла подкачки (pagefile) "
+                "или освободите RAM. Для больших моделей при загрузке тензоров может требоваться заметный объём виртуальной памяти.\n\n"
+            )
         msg = (
             "Ошибка загрузки модели:\n\n%s\n\n"
             "Подробные причины смотрите в логах мастера и воркеров "
             "(консоль, где запущены master/worker, или журнал приложения).\n\n"
-            "%s%s"
+            "%s%s%s"
             "Рекомендации:\n"
             "• Если модель не влезает в выбранный %% свободных ресурсов — увеличьте "
             "«Использование свободных ресурсов (%%)» в настройках (например, до 80–90%%).\n"
             "• Если модель не влезает даже при 100%%:\n"
             "  (a) Переключитесь в режим «Модель по частям (стриминг)»;\n"
             "  (b) Добавьте воркеров в кластер для увеличения суммарных ресурсов."
-        ) % (error, deadline_hint, disk_hint)
+        ) % (error, deadline_hint, disk_hint, swap_hint)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Ошибка загрузки модели")
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
