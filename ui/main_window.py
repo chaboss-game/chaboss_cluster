@@ -387,6 +387,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll.setWidget(self._load_workers_container)
         scroll.setMaximumHeight(120)
         lp_layout.addWidget(scroll)
+        load_prog_widget.setLayout(lp_layout)
         self._load_progress_dock = QtWidgets.QDockWidget("Прогресс модели", self)
         self._load_progress_dock.setWidget(load_prog_widget)
         self._load_progress_dock.setFeatures(
@@ -838,6 +839,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return d
 
         def do_load():
+            self.log_message.emit("Подключение к мастеру %s для загрузки модели..." % self._addr)
             try:
                 channel = grpc.insecure_channel(self._addr)
                 stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
@@ -845,13 +847,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     stream = stub.LoadModelStream(
                         cluster_pb2.LoadModelRequest(hf_model_id=model_id),
                     )
+                    first_event = True
                     for ev in stream:
+                        if first_event:
+                            self.log_message.emit("Первый ответ от мастера получен, отображение прогресса.")
+                            first_event = False
                         self.load_progress_event.emit(_ev_to_dict(ev))
                         if ev.done:
                             self.load_finished.emit(ev.ok, ev.error or "")
                             break
                 except grpc.RpcError as rpc_err:
                     if rpc_err.code() == grpc.StatusCode.UNIMPLEMENTED or "Method not found" in (rpc_err.details() or ""):
+                        self.log_message.emit("Мастер без LoadModelStream, используется загрузка без прогресса (LoadModel).")
                         self.load_progress_event.emit({
                             "master_percent": 0, "master_stage": "download", "master_current_file": "",
                             "workers": {}, "done": False, "ok": False, "error": "",
@@ -869,7 +876,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         raise
                 channel.close()
             except Exception as e:
-                self.load_finished.emit(False, str(e))
+                err_msg = str(e)
+                self.log_message.emit("Ошибка загрузки модели: " + err_msg)
+                self.load_finished.emit(False, err_msg)
 
         # Сразу показываем 0%, чтобы док не был пустым до первого ответа мастера
         self.load_progress_event.emit({
@@ -886,18 +895,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 "• Ошибка «Deadline Exceeded»: сработал таймаут на стороне мастера или воркера. "
                 "Для загрузки шардов (InitShard) дедлайн отключён; если ошибка повторяется — обновите мастер/воркеры до последней версии и проверьте логи.\n\n"
             )
+        disk_hint = ""
+        if "Недостаточно места" in error or "disk" in error.lower() or "os error 112" in error or "ENOSPC" in error:
+            disk_hint = (
+                "• Недостаточно места на диске (воркер): освободите место на том диске, где воркер хранит кэш HuggingFace "
+                "(обычно ~/.cache/huggingface или %USERPROFILE%\\.cache\\huggingface на Windows). "
+                "Либо задайте другую папку через переменную окружения HF_HOME / HUGGINGFACE_HUB_CACHE на воркере.\n\n"
+            )
         msg = (
             "Ошибка загрузки модели:\n\n%s\n\n"
             "Подробные причины смотрите в логах мастера и воркеров "
             "(консоль, где запущены master/worker, или журнал приложения).\n\n"
-            "%s"
+            "%s%s"
             "Рекомендации:\n"
             "• Если модель не влезает в выбранный %% свободных ресурсов — увеличьте "
             "«Использование свободных ресурсов (%%)» в настройках (например, до 80–90%%).\n"
             "• Если модель не влезает даже при 100%%:\n"
             "  (a) Переключитесь в режим «Модель по частям (стриминг)»;\n"
             "  (b) Добавьте воркеров в кластер для увеличения суммарных ресурсов."
-        ) % (error, deadline_hint)
+        ) % (error, deadline_hint, disk_hint)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Ошибка загрузки модели")
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
@@ -925,7 +941,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 bar.setFormat("%s: %%p%%" % key)
                 self._load_worker_bars[key] = bar
                 self._load_workers_layout.addWidget(bar)
-            self._load_worker_bars[key].setValue(min(100, prog.get("percent", 0)))
+            bar = self._load_worker_bars[key]
+            bar.setValue(min(100, prog.get("percent", 0)))
+            # Подсказка с этапом и текущим файлом
+            stage = prog.get("stage") or "download"
+            cur_file = prog.get("current_file") or ""
+            if cur_file:
+                bar.setToolTip("%s: %s — %s (%d%%)" % (key, stage, cur_file, prog.get("percent", 0)))
+            else:
+                bar.setToolTip("%s: %s (%d%%)" % (key, stage, prog.get("percent", 0)))
         if ev.get("done"):
             if ev.get("ok"):
                 self._load_stage_label.setText("Модель успешно загружена: мастер и воркеры готовы")

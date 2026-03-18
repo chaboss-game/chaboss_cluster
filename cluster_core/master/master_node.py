@@ -459,6 +459,8 @@ class MasterNode:
             return ev
 
         try:
+            # Сразу отправляем первое событие, чтобы GUI не висел в ожидании (unload может быть долгим).
+            progress_queue.put(make_event(make_master_progress("unload", 0), {}))
             self.unload_model(None)
             with self._lock:
                 worker_keys = list(self._stubs.keys())
@@ -499,6 +501,9 @@ class MasterNode:
                     shard_keys=shard_keys,
                 )
                 result: list = [None]
+                # Сразу показываем воркер в GUI с 0%, чтобы бар появился
+                workers_progress[key] = cluster_pb2.LoadProgress(stage="download", percent=0)
+                progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
                 def do_init() -> None:
                     result[0] = stub.InitShard(req, timeout=INIT_SHARD_TIMEOUT_S)
                 t = threading.Thread(target=do_init)
@@ -508,7 +513,7 @@ class MasterNode:
                     time.sleep(0.25)
                     try:
                         r = stub.GetLoadProgress(worker_id_pb, timeout=2.0)
-                        if r.progress and (r.progress.percent > 0 or r.progress.bytes_downloaded > 0):
+                        if r.progress:
                             workers_progress[key] = r.progress
                             progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
                     except Exception:  # noqa: S110
