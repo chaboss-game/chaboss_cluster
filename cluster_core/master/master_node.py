@@ -97,6 +97,7 @@ class MasterNode:
         self._desired_worker_configs: Dict[str, WorkerConfig] = {}  # key -> WorkerConfig, обновляется из UI
         self._stop_event = threading.Event()
         self._last_loaded_model_id: str | None = None
+        self._last_loaded_shard_ids: List[str] = []
         # Число подряд неудачных переподключений; RECONNECTING показываем только после N подряд.
         self._reconnect_failures: Dict[str, int] = {}
         self._reconnect_failures_before_status = 2
@@ -369,7 +370,7 @@ class MasterNode:
         Перед загрузкой выгружает текущую модель с воркеров (освобождение VRAM).
         Возвращает (ok, error_message).
         """
-        from cluster_core.master.model_loader import prepare_shard_keys
+        from cluster_core.master.model_loader import prepare_shard_keys, prepare_layer_ranges
 
         self.unload_model(None)
 
@@ -383,17 +384,35 @@ class MasterNode:
         if bad:
             return False, "Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))
 
-        logger.info(
-            "Загрузка модели %s: подготовка меток шардов на мастере (HF -> кэш, разбивка по слоям), воркеров=%d",
-            hf_model_id, len(worker_keys),
-        )
-        try:
-            shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys))
-        except Exception as e:  # noqa: BLE001
-            logger.exception("prepare_shard_keys failed for %s: %s", hf_model_id, e)
-            return False, str(e)
+        mode = getattr(self._cfg, "model_load_mode", "fit_in_cluster") or "fit_in_cluster"
+        shard_keys_list: List[List[str]] | None = None
+        shard_id_list: List[str] = []
 
-        logger.info("Метки шардов подготовлены, команда воркерам скачать с HF: %s", worker_keys)
+        if mode == "streaming_chunks":
+            logger.info("Загрузка модели %s (streaming_chunks): планирование диапазонов слоёв, воркеров=%d", hf_model_id, len(worker_keys))
+            try:
+                ranges = prepare_layer_ranges(hf_model_id, len(worker_keys))
+            except Exception as e:  # noqa: BLE001
+                logger.exception("prepare_layer_ranges failed for %s: %s", hf_model_id, e)
+                return False, str(e)
+            # shard_id кодируем как "start-end" (end не включительно)
+            shard_id_list = [f"{a}-{b}" for a, b in ranges]
+            # если воркеров больше, чем диапазонов (слоёв мало) — оставшиеся пропускаем
+            worker_keys = worker_keys[: len(shard_id_list)]
+            logger.info("Streaming plan готов: %s", shard_id_list)
+        else:
+            logger.info(
+                "Загрузка модели %s (fit_in_cluster): подготовка меток шардов на мастере (HF -> кэш, разбивка по слоям), воркеров=%d",
+                hf_model_id, len(worker_keys),
+            )
+            try:
+                shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys))
+            except Exception as e:  # noqa: BLE001
+                logger.exception("prepare_shard_keys failed for %s: %s", hf_model_id, e)
+                return False, str(e)
+            shard_id_list = [str(i) for i in range(len(worker_keys))]
+
+        logger.info("Команда воркерам подготовиться к модели %s: %s", hf_model_id, worker_keys)
         errors: list[str] = []
         for i, key in enumerate(worker_keys):
             stub = self._stubs.get(key)
@@ -401,16 +420,17 @@ class MasterNode:
                 logger.warning("Воркер %s: нет соединения, пропуск шарда %d", key, i)
                 errors.append(f"{key}: нет соединения")
                 continue
-            shard_keys = shard_keys_list[i] if i < len(shard_keys_list) else []
+            shard_id = shard_id_list[i] if i < len(shard_id_list) else str(i)
+            shard_keys = shard_keys_list[i] if (shard_keys_list is not None and i < len(shard_keys_list)) else []
             logger.info("Команда воркеру %s: скачать с HF и загрузить shard=%d (keys=%d)", key, i, len(shard_keys))
             wid = _parse_worker_id(key)
             req = cluster_pb2.InitShardRequest(
                 spec=cluster_pb2.ShardSpec(
                     model_id=hf_model_id,
-                    shard_id=str(i),
+                    shard_id=shard_id,
                     backend="baseline",
                 ),
-                weight_source="hf",
+                weight_source="hf_stream" if mode == "streaming_chunks" else "hf",
                 hf_model_name=hf_model_id,
                 shard_keys=shard_keys,
             )
@@ -428,6 +448,7 @@ class MasterNode:
         if errors:
             return False, "; ".join(errors)
         self._last_loaded_model_id = hf_model_id
+        self._last_loaded_shard_ids = shard_id_list
         return True, ""
 
     def load_model_with_progress(
@@ -439,7 +460,7 @@ class MasterNode:
         То же, что load_model, но кладёт в progress_queue события LoadModelProgressEvent
         (прогресс мастера и воркеров). В конце кладёт событие с done=True, ok=..., error=...
         """
-        from cluster_core.master.model_loader import prepare_shard_keys
+        from cluster_core.master.model_loader import prepare_shard_keys, prepare_layer_ranges
 
         def make_master_progress(stage: str, percent: int, bytes_done: int = 0, bytes_total: int = 0, current_file: str = "") -> cluster_pb2.LoadProgress:
             return cluster_pb2.LoadProgress(
@@ -482,8 +503,21 @@ class MasterNode:
                     {},
                 ))
 
-            shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
-            progress_queue.put(make_event(make_master_progress("sharding", 100), {}))
+            mode = getattr(self._cfg, "model_load_mode", "fit_in_cluster") or "fit_in_cluster"
+            shard_keys_list: List[List[str]] | None = None
+            shard_id_list: List[str] = []
+            if mode == "streaming_chunks":
+                # Для streaming_chunks мастер скачивает только ради прогресса/плана; веса целиком в RAM не грузим.
+                ranges = prepare_layer_ranges(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
+                shard_id_list = [f"{a}-{b}" for a, b in ranges]
+                worker_keys = worker_keys[: len(shard_id_list)]
+                with self._lock:
+                    stubs_snapshot = {k: stubs_snapshot[k] for k in worker_keys if k in stubs_snapshot}
+                progress_queue.put(make_event(make_master_progress("plan", 100), {}))
+            else:
+                shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
+                shard_id_list = [str(i) for i in range(len(worker_keys))]
+                progress_queue.put(make_event(make_master_progress("sharding", 100), {}))
 
             errors: list[str] = []
             workers_progress: Dict[str, cluster_pb2.LoadProgress] = {}
@@ -492,11 +526,12 @@ class MasterNode:
                 if stub is None:
                     errors.append(f"{key}: нет соединения")
                     continue
-                shard_keys = shard_keys_list[i] if i < len(shard_keys_list) else []
+                shard_id = shard_id_list[i] if i < len(shard_id_list) else str(i)
+                shard_keys = shard_keys_list[i] if (shard_keys_list is not None and i < len(shard_keys_list)) else []
                 wid = _parse_worker_id(key)
                 req = cluster_pb2.InitShardRequest(
-                    spec=cluster_pb2.ShardSpec(model_id=hf_model_id, shard_id=str(i), backend="baseline"),
-                    weight_source="hf",
+                    spec=cluster_pb2.ShardSpec(model_id=hf_model_id, shard_id=shard_id, backend="baseline"),
+                    weight_source="hf_stream" if mode == "streaming_chunks" else "hf",
                     hf_model_name=hf_model_id,
                     shard_keys=shard_keys,
                 )
@@ -530,6 +565,7 @@ class MasterNode:
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="; ".join(errors)))
                 return
             self._last_loaded_model_id = hf_model_id
+            self._last_loaded_shard_ids = shard_id_list
             progress_queue.put(make_event(None, {}, done=True, ok=True, error=""))
         except Exception as e:  # noqa: BLE001
             logger.exception("load_model_with_progress failed: %s", e)
@@ -537,6 +573,51 @@ class MasterNode:
 
     def get_last_loaded_model_id(self) -> str | None:
         return self._last_loaded_model_id
+
+    def remote_update_workers(
+        self,
+        restart_gui: bool,
+        start_worker: bool,
+        git_remote: str = "origin",
+        git_branch: str = "",
+    ) -> tuple[bool, str, list[dict]]:
+        """
+        Рассылает воркерам команду обновиться (git pull) и опционально перезапустить GUI.
+        Возвращает (ok, error, results[]), где results содержит worker/ok/error/output.
+        """
+        with self._lock:
+            stubs_snapshot = dict(self._stubs)
+            worker_keys = list(stubs_snapshot.keys())
+        if not worker_keys:
+            return False, "Нет подключённых воркеров", []
+
+        results: list[dict] = []
+        errors: list[str] = []
+        for key in worker_keys:
+            stub = stubs_snapshot.get(key)
+            if stub is None:
+                results.append({"worker": key, "ok": False, "error": "нет соединения", "output": ""})
+                errors.append(f"{key}: нет соединения")
+                continue
+            try:
+                r = stub.RemoteUpdate(
+                    cluster_pb2.RemoteUpdateRequest(
+                        restart_gui=restart_gui,
+                        start_worker=start_worker,
+                        git_remote=git_remote or "origin",
+                        git_branch=git_branch or "",
+                    ),
+                    timeout=240.0,
+                )
+                results.append({"worker": key, "ok": bool(r.ok), "error": r.error or "", "output": r.output or ""})
+                if not r.ok:
+                    errors.append(f"{key}: {r.error or 'ошибка'}")
+            except Exception as e:  # noqa: BLE001
+                results.append({"worker": key, "ok": False, "error": str(e), "output": ""})
+                errors.append(f"{key}: {e}")
+
+        ok = len(errors) == 0
+        return ok, "; ".join(errors), results
 
     def run_pipeline(self, input_tensor: "torch.Tensor") -> "torch.Tensor":
         """
@@ -551,6 +632,7 @@ class MasterNode:
         current = input_tensor
         request_id = str(uuid.uuid4())
         model_id = self._last_loaded_model_id or ""
+        shard_ids = list(self._last_loaded_shard_ids) if self._last_loaded_shard_ids else [str(i) for i in range(len(worker_keys))]
 
         for i, key in enumerate(worker_keys):
             stub = self._stubs.get(key)
@@ -562,7 +644,7 @@ class MasterNode:
                 tensor=payload,
                 is_last=True,
                 model_id=model_id,
-                shard_id=str(i),
+                shard_id=shard_ids[i] if i < len(shard_ids) else str(i),
             )
             response_iter = stub.RunStage(iter([req]), timeout=60.0)
             resp = next(response_iter, None)

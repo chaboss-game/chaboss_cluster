@@ -137,3 +137,28 @@ class MasterAdminService(cluster_pb2_grpc.MasterAdminServiceServicer):
             return cluster_pb2.UpdateWorkersConfigResponse(ok=ok, error=err or "")
         except Exception as e:
             return cluster_pb2.UpdateWorkersConfigResponse(ok=False, error=str(e))
+
+    def RemoteUpdateWorkers(
+        self,
+        request: cluster_pb2.RemoteUpdateWorkersRequest,
+        context: grpc.ServicerContext,
+    ) -> cluster_pb2.RemoteUpdateWorkersResponse:
+        if self._master_node is None:
+            return cluster_pb2.RemoteUpdateWorkersResponse(ok=False, error="Мастер не готов")
+        ok, err, results = self._master_node.remote_update_workers(
+            restart_gui=bool(request.restart_gui),
+            start_worker=bool(request.start_worker),
+            git_remote=(request.git_remote or "origin").strip() or "origin",
+            git_branch=(request.git_branch or "").strip(),
+        )
+        resp = cluster_pb2.RemoteUpdateWorkersResponse(ok=ok, error=err or "")
+        for r in results:
+            resp.results.append(
+                cluster_pb2.RemoteWorkerUpdateResult(
+                    worker=r.get("worker", ""),
+                    ok=bool(r.get("ok", False)),
+                    error=r.get("error", "") or "",
+                    output=r.get("output", "") or "",
+                )
+            )
+        return resp

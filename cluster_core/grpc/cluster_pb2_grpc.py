@@ -64,6 +64,11 @@ class WorkerServiceStub(object):
                 request_serializer=cluster__pb2.HealthPing.SerializeToString,
                 response_deserializer=cluster__pb2.HealthPong.FromString,
                 _registered_method=True)
+        self.RemoteUpdate = channel.unary_unary(
+                '/cluster.WorkerService/RemoteUpdate',
+                request_serializer=cluster__pb2.RemoteUpdateRequest.SerializeToString,
+                response_deserializer=cluster__pb2.RemoteUpdateResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -105,6 +110,12 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RemoteUpdate(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -137,6 +148,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.HealthStream,
                     request_deserializer=cluster__pb2.HealthPing.FromString,
                     response_serializer=cluster__pb2.HealthPong.SerializeToString,
+            ),
+            'RemoteUpdate': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoteUpdate,
+                    request_deserializer=cluster__pb2.RemoteUpdateRequest.FromString,
+                    response_serializer=cluster__pb2.RemoteUpdateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -311,6 +327,33 @@ class WorkerService(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def RemoteUpdate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.WorkerService/RemoteUpdate',
+            cluster__pb2.RemoteUpdateRequest.SerializeToString,
+            cluster__pb2.RemoteUpdateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class MasterAdminServiceStub(object):
     """Missing associated documentation comment in .proto file."""
@@ -345,6 +388,11 @@ class MasterAdminServiceStub(object):
                 '/cluster.MasterAdminService/UpdateWorkersConfig',
                 request_serializer=cluster__pb2.UpdateWorkersConfigRequest.SerializeToString,
                 response_deserializer=cluster__pb2.UpdateWorkersConfigResponse.FromString,
+                _registered_method=True)
+        self.RemoteUpdateWorkers = channel.unary_unary(
+                '/cluster.MasterAdminService/RemoteUpdateWorkers',
+                request_serializer=cluster__pb2.RemoteUpdateWorkersRequest.SerializeToString,
+                response_deserializer=cluster__pb2.RemoteUpdateWorkersResponse.FromString,
                 _registered_method=True)
 
 
@@ -381,6 +429,12 @@ class MasterAdminServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RemoteUpdateWorkers(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_MasterAdminServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -408,6 +462,11 @@ def add_MasterAdminServiceServicer_to_server(servicer, server):
                     servicer.UpdateWorkersConfig,
                     request_deserializer=cluster__pb2.UpdateWorkersConfigRequest.FromString,
                     response_serializer=cluster__pb2.UpdateWorkersConfigResponse.SerializeToString,
+            ),
+            'RemoteUpdateWorkers': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoteUpdateWorkers,
+                    request_deserializer=cluster__pb2.RemoteUpdateWorkersRequest.FromString,
+                    response_serializer=cluster__pb2.RemoteUpdateWorkersResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -545,6 +604,33 @@ class MasterAdminService(object):
             '/cluster.MasterAdminService/UpdateWorkersConfig',
             cluster__pb2.UpdateWorkersConfigRequest.SerializeToString,
             cluster__pb2.UpdateWorkersConfigResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoteUpdateWorkers(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cluster.MasterAdminService/RemoteUpdateWorkers',
+            cluster__pb2.RemoteUpdateWorkersRequest.SerializeToString,
+            cluster__pb2.RemoteUpdateWorkersResponse.FromString,
             options,
             channel_credentials,
             insecure,

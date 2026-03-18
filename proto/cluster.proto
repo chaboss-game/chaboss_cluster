@@ -125,6 +125,19 @@ message GetLoadProgressResponse {
   LoadProgress progress = 1;
 }
 
+message RemoteUpdateRequest {
+  bool restart_gui = 1;       // перезапустить GUI на воркере (если запущен)
+  bool start_worker = 2;      // передать флаг --start-worker при рестарте GUI
+  string git_remote = 3;      // default "origin"
+  string git_branch = 4;      // default: текущая
+}
+
+message RemoteUpdateResponse {
+  bool ok = 1;
+  string error = 2;
+  string output = 3;         // stdout/stderr git pull + доп. сообщения
+}
+
 service WorkerService {
   rpc GetStatus(WorkerId) returns (WorkerDescriptor);
   rpc GetLoadProgress(WorkerId) returns (GetLoadProgressResponse);
@@ -132,6 +145,7 @@ service WorkerService {
   rpc UnloadShard(UnloadShardRequest) returns (UnloadShardResponse);
   rpc RunStage(stream StageRequest) returns (stream StageResponse);
   rpc HealthStream(stream HealthPing) returns (stream HealthPong);
+  rpc RemoteUpdate(RemoteUpdateRequest) returns (RemoteUpdateResponse);
 }
 
 // Admin API (master-side), for UI and external tools.
@@ -184,6 +198,26 @@ message UpdateWorkersConfigResponse {
   string error = 2;
 }
 
+message RemoteUpdateWorkersRequest {
+  bool restart_gui = 1;
+  bool start_worker = 2;
+  string git_remote = 3;
+  string git_branch = 4;
+}
+
+message RemoteWorkerUpdateResult {
+  string worker = 1;  // "host:port"
+  bool ok = 2;
+  string error = 3;
+  string output = 4;
+}
+
+message RemoteUpdateWorkersResponse {
+  repeated RemoteWorkerUpdateResult results = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
 message UnloadModelRequest {
   string model_id = 1;  // пусто = выгрузить текущую загруженную модель со всех воркеров
 }
@@ -199,5 +233,6 @@ service MasterAdminService {
   rpc LoadModelStream(LoadModelRequest) returns (stream LoadModelProgressEvent);
   rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
   rpc UpdateWorkersConfig(UpdateWorkersConfigRequest) returns (UpdateWorkersConfigResponse);
+  rpc RemoteUpdateWorkers(RemoteUpdateWorkersRequest) returns (RemoteUpdateWorkersResponse);
 }
 

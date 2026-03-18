@@ -8,7 +8,7 @@ from __future__ import annotations
 import io
 import logging
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Tuple
 
 import torch
 
@@ -213,3 +213,57 @@ def prepare_shard_keys(
     key_lists: List[List[str]] = [sorted(sd.keys()) for sd in shard_dicts]
     logger.info("Подготовлены shard_keys для %d шардов (пример: shard0=%d keys)", len(key_lists), len(key_lists[0]) if key_lists else 0)
     return key_lists
+
+
+def prepare_layer_ranges(
+    hf_model_id: str,
+    n_workers: int,
+    progress_callback: Callable[[float, int, int, str], None] | None = None,
+) -> List[Tuple[int, int]]:
+    """
+    План для режима streaming_chunks: вычисляет диапазоны слоёв для воркеров без загрузки всего state_dict в RAM.
+    1) Скачивает safetensors в кэш (с прогрессом, если задан callback)
+    2) Сканирует только ключи в .safetensors и определяет индексы слоёв (model.layers.N.)
+    3) Делит слои на n_workers непрерывными диапазонами [start, end) (end не включительно)
+    """
+    if n_workers <= 0:
+        raise ValueError("n_workers должно быть >= 1")
+    from cluster_core.common.hf_download import download_repo_with_progress
+
+    path = download_repo_with_progress(hf_model_id, progress_callback=progress_callback) if progress_callback else download_repo_with_progress(hf_model_id)
+
+    st_files = sorted(Path(path).glob("*.safetensors"))
+    if not st_files:
+        raise FileNotFoundError(f"Для streaming_chunks нужны .safetensors, но в {path} их нет")
+    try:
+        import re as _re
+        from safetensors import safe_open
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Для streaming_chunks нужен пакет safetensors: {e}") from e
+
+    layer_re = _re.compile(r"^model\.layers\.(\d+)\.")
+    indices: set[int] = set()
+    for sf in st_files:
+        with safe_open(str(sf), framework="pt", device="cpu") as f:
+            for k in f.keys():
+                m = layer_re.match(k)
+                if m:
+                    indices.add(int(m.group(1)))
+    if not indices:
+        raise RuntimeError("Не удалось определить слои по ключам (ожидались model.layers.N.).")
+    ordered = sorted(indices)
+    layer_min, layer_max = ordered[0], ordered[-1]
+    total_layers = layer_max - layer_min + 1
+    # Равномерно делим непрерывный диапазон на n_workers
+    n = min(n_workers, total_layers)
+    base = total_layers // n
+    rem = total_layers % n
+    ranges: List[Tuple[int, int]] = []
+    cur = layer_min
+    for i in range(n):
+        size = base + (1 if i < rem else 0)
+        ranges.append((cur, cur + size))
+        cur += size
+    # Если воркеров больше слоёв, последние диапазоны будут пустыми; не выдаём их.
+    logger.info("Streaming plan: layers=%d (min=%d max=%d) workers=%d ranges=%s", total_layers, layer_min, layer_max, n_workers, ranges)
+    return ranges

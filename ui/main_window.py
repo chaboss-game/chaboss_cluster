@@ -286,12 +286,15 @@ class MainWindow(QtWidgets.QMainWindow):
         add_btn = QtWidgets.QPushButton("Добавить")
         remove_btn = QtWidgets.QPushButton("Удалить")
         apply_btn = QtWidgets.QPushButton("Применить конфиг на мастере")
+        update_btn = QtWidgets.QPushButton("Обновить воркеры (git pull)")
         add_btn.clicked.connect(self._add_worker_row)
         remove_btn.clicked.connect(self._remove_worker_row)
         apply_btn.clicked.connect(self._on_apply_workers_config)
+        update_btn.clicked.connect(self._on_remote_update_workers)
         w_btn_layout.addWidget(add_btn)
         w_btn_layout.addWidget(remove_btn)
         w_btn_layout.addWidget(apply_btn)
+        w_btn_layout.addWidget(update_btn)
         w_btn_layout.addStretch()
         w_layout.addWidget(self._workers_table)
         w_layout.addLayout(w_btn_layout)
@@ -791,6 +794,47 @@ class MainWindow(QtWidgets.QMainWindow):
             self.append_log("Ошибка применения конфига воркеров: " + error)
             self.statusBar().showMessage(f"Ошибка применения конфига: {error}")
 
+    def _on_remote_update_workers(self) -> None:
+        """Попросить мастера обновить все воркеры: git pull + (опционально) рестарт GUI на воркерах."""
+        self._apply_master_addr_from_edit()
+        self._save_settings()
+        self.append_log("Remote update воркеров: git pull + restart GUI (--start-worker)...")
+        self.statusBar().showMessage("Remote update воркеров...")
+
+        def do_update() -> None:
+            try:
+                channel = grpc.insecure_channel(self._addr)
+                stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                resp = stub.RemoteUpdateWorkers(
+                    cluster_pb2.RemoteUpdateWorkersRequest(
+                        restart_gui=True,
+                        start_worker=True,
+                        git_remote="origin",
+                        git_branch="",
+                    ),
+                    timeout=300.0,
+                )
+                channel.close()
+                if not resp.ok:
+                    self.log_message.emit("Remote update: ошибка мастера: " + (resp.error or ""))
+                for r in resp.results:
+                    if r.ok:
+                        msg = f"{r.worker}: ok"
+                    else:
+                        msg = f"{r.worker}: ошибка: {r.error}"
+                    if r.output:
+                        out = r.output.strip().replace("\r\n", "\n")
+                        if len(out) > 400:
+                            out = out[:400] + "\n... (truncated)"
+                        msg += "\n" + out
+                    self.log_message.emit(msg)
+                self.statusBar().showMessage("Remote update завершён")
+            except Exception as e:
+                self.log_message.emit("Remote update: исключение: " + str(e))
+                self.statusBar().showMessage("Remote update: ошибка")
+
+        threading.Thread(target=do_update, daemon=True).start()
+
     def _on_scan(self) -> None:
         self._apply_master_addr_from_edit()
         self._save_settings()
@@ -1138,11 +1182,20 @@ class WorkerTableModel(QtCore.QAbstractTableModel):
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Chaboss Cluster GUI")
+    parser.add_argument("--start-worker", action="store_true", help="Автоматически запустить воркера при старте GUI")
+    args, _ = parser.parse_known_args()
+
     app = QtWidgets.QApplication(sys.argv)
     master_addr = (os.environ.get("CLUSTER_MASTER_ADDR") or "").strip() or None
     win = MainWindow(master_addr=master_addr)
     win.resize(900, 500)
     win.show()
+    if args.start_worker:
+        # Запуск после показа окна, чтобы UI успел инициализироваться.
+        QtCore.QTimer.singleShot(0, win._on_start_worker)
     sys.exit(app.exec())
 
 
