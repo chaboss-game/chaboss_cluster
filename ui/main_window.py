@@ -461,8 +461,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_send_status = QtWidgets.QLabel("")
         send_layout.addWidget(self._chat_send_btn)
         send_layout.addWidget(self._chat_send_status)
+        send_grp.setLayout(send_layout)
+        send_grp.setMinimumHeight(220)
         # Нижняя панель "Отправка" должна быть видна без скролла.
-        chat_tab_layout.addWidget(send_grp, 2)
+        chat_tab_layout.addWidget(send_grp, 1)
         chat_tab.setLayout(chat_tab_layout)
 
         # ——— Вкладка «Воркер» ———

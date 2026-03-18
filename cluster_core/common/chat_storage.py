@@ -153,21 +153,26 @@ class ChatStorage:
                         raise ValueError("channel_id required for create")
                     if not name:
                         raise ValueError("name required for create")
-                    if channel_id in self._channels:
-                        raise ValueError(f"channel already exists: {channel_id}")
+                    # Идемпотентность: если канал уже существует — обновим имя, но не падём.
                     self._channels[channel_id] = name
                 elif t == "rename":
+                    # Идемпотентность: если канала нет — ничего не делаем.
                     if not channel_id or channel_id not in self._channels:
-                        raise ValueError(f"unknown channel: {channel_id}")
+                        continue
                     if not name:
-                        raise ValueError("name required for rename")
+                        continue
                     self._channels[channel_id] = name
                 elif t == "delete":
+                    # Идемпотентность: если канала нет — ничего не делаем.
                     if not channel_id or channel_id not in self._channels:
-                        raise ValueError(f"unknown channel: {channel_id}")
+                        continue
                     del self._channels[channel_id]
                 else:
                     raise ValueError(f"unknown mutation type: {t}")
+
+            # Бэкап: канал general должен существовать всегда.
+            if "general" not in self._channels:
+                self._channels["general"] = "general"
 
             channels_arr = [{"id": cid, "name": name} for cid, name in self._channels.items()]
             _safe_json_dump(self._channels_path, channels_arr)
