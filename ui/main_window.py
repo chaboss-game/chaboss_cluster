@@ -955,18 +955,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 "• На Windows не хватает файла подкачки (os error 1455). Увеличьте размер файла подкачки (pagefile) "
                 "или освободите RAM. Для больших моделей при загрузке тензоров может требоваться заметный объём виртуальной памяти.\n\n"
             )
+        reset_hint = ""
+        if "Connection reset" in error or "connection reset" in error.lower() or "UNAVAILABLE" in error:
+            reset_hint = (
+                "• «Connection reset by peer» / UNAVAILABLE: соединение оборвалось со стороны воркера — "
+                "чаще всего процесс воркера завершился (нехватка RAM/файла подкачки, падение Python). "
+                "На машине этого воркера откройте logs/worker.log и журнал Windows (Просмотр событий). "
+                "Попробуйте режим «Модель по частям (стриминг)» или увеличьте файл подкачки на этом узле.\n\n"
+            )
         msg = (
             "Ошибка загрузки модели:\n\n%s\n\n"
             "Подробные причины смотрите в логах мастера и воркеров "
             "(консоль, где запущены master/worker, или журнал приложения).\n\n"
-            "%s%s%s"
+            "%s%s%s%s"
             "Рекомендации:\n"
             "• Если модель не влезает в выбранный %% свободных ресурсов — увеличьте "
             "«Использование свободных ресурсов (%%)» в настройках (например, до 80–90%%).\n"
             "• Если модель не влезает даже при 100%%:\n"
             "  (a) Переключитесь в режим «Модель по частям (стриминг)»;\n"
             "  (b) Добавьте воркеров в кластер для увеличения суммарных ресурсов."
-        ) % (error, deadline_hint, disk_hint, swap_hint)
+        ) % (error, deadline_hint, disk_hint, swap_hint, reset_hint)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Ошибка загрузки модели")
         box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
