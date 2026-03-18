@@ -535,12 +535,16 @@ class MasterNode:
                     hf_model_name=hf_model_id,
                     shard_keys=shard_keys,
                 )
-                result: list = [None]
-                # Сразу показываем воркер в GUI с 0%, чтобы бар появился
+                result: list = [None, None]  # [InitShardResponse, exception]
                 workers_progress[key] = cluster_pb2.LoadProgress(stage="download", percent=0)
                 progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
+
                 def do_init() -> None:
-                    result[0] = stub.InitShard(req, timeout=INIT_SHARD_TIMEOUT_S)
+                    try:
+                        result[0] = stub.InitShard(req, timeout=INIT_SHARD_TIMEOUT_S)
+                    except Exception as e:  # noqa: BLE001
+                        result[1] = e
+
                 t = threading.Thread(target=do_init)
                 t.start()
                 worker_id_pb = cluster_pb2.WorkerId(host=wid.host, port=wid.port)
@@ -557,7 +561,18 @@ class MasterNode:
                 if result[0] and not result[0].ok:
                     errors.append(f"{key}: {result[0].error}")
                 elif result[0] is None:
-                    errors.append(f"{key}: нет ответа")
+                    exc = result[1]
+                    if exc is None:
+                        err_detail = "нет ответа"
+                    else:
+                        err_detail = str(exc)
+                        if hasattr(exc, "code") and callable(getattr(exc, "code", None)):
+                            try:
+                                err_detail = f"{exc.code().name if hasattr(exc.code(), 'name') else exc.code()} — {err_detail}"
+                            except Exception:
+                                pass
+                        logger.warning("InitShard failed for %s: %s", key, exc, exc_info=True)
+                    errors.append(f"{key}: {err_detail}")
                 workers_progress[key] = cluster_pb2.LoadProgress(stage="done", percent=100)
                 progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import shutil
 import subprocess
 import platform
 import hashlib
@@ -700,13 +701,19 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         git_remote = (request.git_remote or "origin").strip() or "origin"
         git_branch = (request.git_branch or "").strip()
 
-        # Убираем PID-файл до pull, иначе git откажет: "untracked working tree files would be overwritten by merge"
+        # Убираем файлы/каталоги, из-за которых git pull выдаёт "untracked working tree files would be overwritten by merge"
         pid_file = project_root / ".chaboss_gui.pid"
         if pid_file.exists():
             try:
                 pid_file.unlink()
             except OSError:
                 pass
+        for pycache in project_root.rglob("__pycache__"):
+            if pycache.is_dir():
+                try:
+                    shutil.rmtree(pycache, ignore_errors=True)
+                except OSError:
+                    pass
 
         cmd = ["git", "pull", "--rebase", "--autostash", git_remote]
         if git_branch:
