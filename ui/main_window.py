@@ -414,7 +414,9 @@ class MainWindow(QtWidgets.QMainWindow):
         chat_split.setStretchFactor(0, 1)
         chat_split.setStretchFactor(1, 3)
         chat_split.setStretchFactor(2, 2)
-        chat_tab_layout.addWidget(chat_split, 3)
+        # Делаем верхний сплиттер менее "высоким", чтобы нижняя панель "Отправка"
+        # (получатели/кнопка/статус) не уезжала за пределы окна.
+        chat_tab_layout.addWidget(chat_split, 2)
 
         # Панель отправки (получатели/текст/вложения)
         send_grp = QtWidgets.QGroupBox("Отправка")
@@ -423,6 +425,7 @@ class MainWindow(QtWidgets.QMainWindow):
         send_layout.addWidget(QtWidgets.QLabel("Получатели (выбранные воркеры онлайн):"))
         self._chat_workers_checklist = QtWidgets.QListWidget()
         self._chat_workers_checklist.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self._chat_workers_checklist.setMaximumHeight(120)
         send_layout.addWidget(self._chat_workers_checklist)
 
         send_layout.addWidget(QtWidgets.QLabel("Текст:"))
@@ -450,6 +453,7 @@ class MainWindow(QtWidgets.QMainWindow):
         send_layout.addLayout(attach_row)
 
         self._chat_selected_files_list = QtWidgets.QListWidget()
+        self._chat_selected_files_list.setMaximumHeight(90)
         send_layout.addWidget(self._chat_selected_files_list)
 
         self._chat_send_btn = QtWidgets.QPushButton("Отправить")
@@ -457,7 +461,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_send_status = QtWidgets.QLabel("")
         send_layout.addWidget(self._chat_send_btn)
         send_layout.addWidget(self._chat_send_status)
-        chat_tab_layout.addWidget(send_grp, 1)
+        # Нижняя панель "Отправка" должна быть видна без скролла.
+        chat_tab_layout.addWidget(send_grp, 2)
         chat_tab.setLayout(chat_tab_layout)
 
         # ——— Вкладка «Воркер» ———
@@ -1472,13 +1477,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         for o in ops
                     ]
                 )
-                _ = stub.MutateChatChannels(req, timeout=10.0)
+                r = stub.MutateChatChannels(req, timeout=10.0)
                 ch.close()
             except Exception as e:
                 self.append_log("Ошибка изменения каналов: %s" % e)
+                QtWidgets.QMessageBox.warning(self, "Чат", "Ошибка изменения каналов: %s" % e)
                 return
             # reload
             self._chat_load_channels()
+            QtWidgets.QMessageBox.information(self, "Чат", "Каналы обновлены")
 
         threading.Thread(target=do_mutate, daemon=True).start()
 
@@ -1839,6 +1846,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._chat_send_btn.setEnabled(False)
         self._chat_send_status.setText("Отправка...")
+        self.append_log(f"Чат: отправка сообщения {message_id} (канал={channel_id}, вложений={len(self._chat_pending_attachments)})")
 
         def gen() -> Any:
             yield cluster_pb2.ChatPostChunk(header=header)
@@ -1887,6 +1895,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     # обновить чат
                     self._chat_poll_history(force=False)
                     self.chat_send_finished.emit(True, "")
+                    self.append_log(f"Чат: сообщение {message_id} отправлено")
                 else:
                     self.chat_send_finished.emit(False, resp.error or "Ошибка отправки")
             except Exception as e:  # noqa: BLE001
