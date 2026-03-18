@@ -26,7 +26,7 @@ logger = logging.getLogger("master.node")
 HEARTBEAT_INTERVAL_S = 2.0
 RECONNECT_BACKOFF_INITIAL_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
-GET_STATUS_TIMEOUT_S = 15.0  # таймаут GetStatus при подключении/переподключении (медленная сеть или загрузка воркера)
+GET_STATUS_TIMEOUT_S = 30.0  # таймаут GetStatus при подключении/переподключении (медленная сеть, холодный старт Windows)
 # InitShard: загрузка с HF и загрузка шарда на воркере может занимать десятки минут.
 # Явно задаём большой таймаут (7 дней); None в gRPC может подменяться дефолтом.
 INIT_SHARD_TIMEOUT_S = 86400 * 7
