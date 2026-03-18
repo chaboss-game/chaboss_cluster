@@ -85,6 +85,17 @@ def _layer_index_from_key_llama(key: str) -> int | None:
     return None
 
 
+def _layer_index_from_key_language_model_layers(key: str) -> int | None:
+    """Qwen3.5 MoE / VL: 'model.language_model.layers.0.xxx' -> 0."""
+    prefix = "model.language_model.layers."
+    if prefix in key:
+        rest = key.split(prefix, 1)[1]
+        num = rest.split(".", 1)[0]
+        if num.isdigit():
+            return int(num)
+    return None
+
+
 def _split_state_dict_by_layers(
     state_dict: dict,
     n_workers: int,
@@ -126,6 +137,11 @@ def _split_state_dict_by_llama_layers(state_dict: dict, n_workers: int) -> List[
     return _split_state_dict_by_layers(state_dict, n_workers, _layer_index_from_key_llama)
 
 
+def _split_state_dict_by_language_model_layers(state_dict: dict, n_workers: int) -> List[dict]:
+    """Разбиение по model.language_model.layers.i (Qwen3.5 MoE и др.)."""
+    return _split_state_dict_by_layers(state_dict, n_workers, _layer_index_from_key_language_model_layers)
+
+
 def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
     """
     Обеспечивает наличие модели в кэше HF, загружает state_dict,
@@ -137,10 +153,13 @@ def prepare_shards(hf_model_id: str, n_workers: int) -> List[bytes]:
     state_dict = _state_dict_from_hf(hf_model_id)
     keys = list(state_dict.keys())
     logger.info("Начало разбивки state_dict по слоям для n_workers=%d", n_workers)
-    # Выбор разбиения по слоям по префиксам ключей (приоритет: GPT-2, LLaMA, BERT)
+    # Выбор разбиения по слоям по префиксам ключей
     if any("transformer.h." in k for k in keys):
         shard_dicts = _split_state_dict_by_gpt2_layers(state_dict, n_workers)
         shard_type = "GPT-2 (transformer.h)"
+    elif any("model.language_model.layers." in k for k in keys):
+        shard_dicts = _split_state_dict_by_language_model_layers(state_dict, n_workers)
+        shard_type = "language_model.layers (Qwen3.5 MoE / VL)"
     elif any("model.layers." in k for k in keys):
         shard_dicts = _split_state_dict_by_llama_layers(state_dict, n_workers)
         shard_type = "LLaMA (model.layers)"
@@ -191,6 +210,9 @@ def prepare_shard_keys(
     if any("transformer.h." in k for k in keys):
         shard_dicts = _split_state_dict_by_gpt2_layers(state_dict, n_workers)
         shard_type = "GPT-2 (transformer.h)"
+    elif any("model.language_model.layers." in k for k in keys):
+        shard_dicts = _split_state_dict_by_language_model_layers(state_dict, n_workers)
+        shard_type = "language_model.layers (Qwen3.5 MoE / VL)"
     elif any("model.layers." in k for k in keys):
         shard_dicts = _split_state_dict_by_llama_layers(state_dict, n_workers)
         shard_type = "LLaMA (model.layers)"
@@ -241,16 +263,19 @@ def prepare_layer_ranges(
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"Для streaming_chunks нужен пакет safetensors: {e}") from e
 
-    layer_re = _re.compile(r"^model\.layers\.(\d+)\.")
+    re_lm = _re.compile(r"^model\.language_model\.layers\.(\d+)\.")
+    re_plain = _re.compile(r"^model\.layers\.(\d+)\.")
     indices: set[int] = set()
     for sf in st_files:
         with safe_open(str(sf), framework="pt", device="cpu") as f:
             for k in f.keys():
-                m = layer_re.match(k)
+                m = re_lm.match(k) or re_plain.match(k)
                 if m:
                     indices.add(int(m.group(1)))
     if not indices:
-        raise RuntimeError("Не удалось определить слои по ключам (ожидались model.layers.N.).")
+        raise RuntimeError(
+            "Не удалось определить слои по ключам (ожидались model.layers.N. или model.language_model.layers.N.)."
+        )
     ordered = sorted(indices)
     layer_min, layer_max = ordered[0], ordered[-1]
     total_layers = layer_max - layer_min + 1

@@ -4,6 +4,9 @@ config/master.yaml
 # PID-файл GUI (создаётся при --start-worker, блокирует git pull если не игнорировать)
 .chaboss_gui.pid
 
+# Логи воркера (scripts/run_worker.py)
+logs/
+
 # Временные/автосейв файлы конфигов (редакторы)
 config/*.yaml~
 config/*.yml~

@@ -168,6 +168,74 @@ def _layer_indices_from_state_dict_qwen2(state_dict: dict) -> List[int]:
     return _layer_indices_from_state_dict_llama(state_dict)
 
 
+def _try_build_qwen3_5_moe_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
+    """
+    Qwen3.5 MoE (ключи model.language_model.layers.N.*).
+    GPTQ-чекпоинты (qweight/qzeros) не совместимы с обычным DecoderLayer — возвращаем None.
+    """
+    if not any(k.startswith("model.language_model.layers.") for k in state_dict):
+        return None
+    try:
+        from transformers import AutoConfig
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+    except ImportError:
+        return None
+    try:
+        _cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        _qc = getattr(_cfg, "quantization_config", None)
+        if _qc is not None:
+            _qm = getattr(_qc, "quant_method", None) or (
+                _qc.get("quant_method") if isinstance(_qc, dict) else None
+            )
+            if str(_qm).lower() == "gptq":
+                logger.warning(
+                    "Qwen3.5 MoE + GPTQ: сборка nn.Module на воркере не поддерживается (ключи qweight/...). "
+                    "Используйте шардирование по слоям (обновлённый мастер) и режим «модель по частям» или увеличьте файл подкачки."
+                )
+                return None
+    except Exception:
+        pass
+    indices: set[int] = set()
+    prefix_base = "model.language_model.layers."
+    for k in state_dict:
+        if not k.startswith(prefix_base):
+            continue
+        rest = k[len(prefix_base) :].split(".", 1)[0]
+        if rest.isdigit():
+            indices.add(int(rest))
+    indices_l = sorted(indices)
+    if not indices_l:
+        return None
+    try:
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    except Exception:
+        return None
+    tc = getattr(config, "text_config", None)
+    if tc is None:
+        return None
+    if isinstance(tc, dict):
+        try:
+            text_cfg = Qwen3_5MoeTextConfig(**tc)
+        except Exception:
+            return None
+    elif isinstance(tc, Qwen3_5MoeTextConfig):
+        text_cfg = tc
+    else:
+        return None
+    layers: List[nn.Module] = []
+    for idx in indices_l:
+        prefix_full = f"{prefix_base}{idx}."
+        sub = {k[len(prefix_full) :]: v for k, v in state_dict.items() if k.startswith(prefix_full)}
+        if not sub:
+            return None
+        layer = Qwen3_5MoeDecoderLayer(text_cfg, layer_idx=idx)
+        _load_state_dict_into(layer, sub)
+        layer.eval()
+        layers.append(layer)
+    return nn.Sequential(*layers)
+
+
 def _try_build_qwen2_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
     """
     Собирает nn.Module из state_dict для Qwen2 (model.layers.i).
@@ -204,7 +272,7 @@ def _try_build_qwen2_layers_module(model_id: str, state_dict: dict) -> nn.Module
 def _try_build_layers_module(model_id: str, state_dict: dict) -> nn.Module | None:
     """
     Пробует собрать Sequential слоёв по ключам state_dict.
-    Порядок: BERT -> GPT-2 -> LLaMA -> Qwen2.
+    Порядок: BERT -> GPT-2 -> Qwen3.5 MoE (language_model.layers) -> LLaMA -> Qwen2.
     """
     if not state_dict or not model_id:
         return None
@@ -212,6 +280,9 @@ def _try_build_layers_module(model_id: str, state_dict: dict) -> nn.Module | Non
     if module is not None:
         return module
     module = _try_build_gpt2_layers_module(model_id, state_dict)
+    if module is not None:
+        return module
+    module = _try_build_qwen3_5_moe_layers_module(model_id, state_dict)
     if module is not None:
         return module
     module = _try_build_llama_layers_module(model_id, state_dict)
@@ -772,28 +843,50 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         if not st_files:
             raise FileNotFoundError(f"Нет .safetensors в {base_path}")
 
-        cfg = AutoConfig.from_pretrained(model_id)
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        mt = getattr(cfg, "model_type", "") or ""
+        use_lm_prefix = mt == "qwen3_5_moe" or type(cfg).__name__ == "Qwen3_5MoeConfig"
+
+        def layer_key_prefix(layer_idx: int) -> str:
+            if use_lm_prefix:
+                return f"model.language_model.layers.{layer_idx}."
+            return f"model.layers.{layer_idx}."
 
         def load_layer_state(layer_idx: int) -> Dict[str, Any]:
-            prefix = f"model.layers.{layer_idx}."
+            prefix = layer_key_prefix(layer_idx)
             sd: Dict[str, Any] = {}
             for sf in st_files:
                 with safe_open(str(sf), framework="pt", device="cpu") as f:
                     for k in f.keys():
                         if k.startswith(prefix):
-                            sd[k[len(prefix):]] = f.get_tensor(k)
+                            sd[k[len(prefix) :]] = f.get_tensor(k)
             return sd
 
-        def build_layer(layer_sd: Dict[str, Any]) -> nn.Module:
+        def build_layer(layer_idx: int, layer_sd: Dict[str, Any]) -> nn.Module:
+            if use_lm_prefix:
+                try:
+                    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+                    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
+                except ImportError as e:
+                    raise RuntimeError(f"Нужен transformers с Qwen3.5 MoE: {e}") from e
+                tc = getattr(cfg, "text_config", None)
+                if isinstance(tc, dict):
+                    text_cfg = Qwen3_5MoeTextConfig(**tc)
+                elif isinstance(tc, Qwen3_5MoeTextConfig):
+                    text_cfg = tc
+                else:
+                    raise RuntimeError("Qwen3.5 MoE: нет text_config")
+                layer = Qwen3_5MoeDecoderLayer(text_cfg, layer_idx=layer_idx)
+                _load_state_dict_into(layer, layer_sd)
+                layer.eval()
+                return layer
             layer: nn.Module | None = None
-            # Qwen2
             try:
                 from transformers import Qwen2DecoderLayer, Qwen2Config
                 if isinstance(cfg, Qwen2Config):
                     layer = Qwen2DecoderLayer(cfg)
             except Exception:
                 layer = None
-            # LLaMA
             if layer is None:
                 try:
                     from transformers import LlamaDecoderLayer, LlamaConfig
@@ -801,7 +894,6 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                         layer = LlamaDecoderLayer(cfg)
                 except Exception:
                     layer = None
-            # Fallback: часто работает на форках, где config наследуется иначе
             if layer is None:
                 from transformers import LlamaDecoderLayer
                 layer = LlamaDecoderLayer(cfg)
@@ -816,8 +908,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             for idx in range(start, end):
                 layer_sd = load_layer_state(idx)
                 if not layer_sd:
-                    raise KeyError(f"Не найдены ключи слоя model.layers.{idx}.* в safetensors")
-                layer = build_layer(layer_sd)
+                    raise KeyError(f"Не найдены ключи слоя {layer_key_prefix(idx)}* в safetensors")
+                layer = build_layer(idx, layer_sd)
                 out = layer(cur)
                 if isinstance(out, tuple):
                     out = out[0]

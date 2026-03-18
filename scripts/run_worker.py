@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from concurrent import futures
+from pathlib import Path
 
 import grpc
 
@@ -25,8 +27,28 @@ def main() -> None:
     args = parse_args()
     cfg = load_worker_config(args.config)
 
-    logging.basicConfig(level=logging.INFO)
+    project_root = Path(__file__).resolve().parent.parent
+    log_dir = project_root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "worker.log"
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(fmt))
+    root.addHandler(fh)
+    if sys.stderr not in (None,) and not getattr(sys.stderr, "closed", False):
+        try:
+            sh = logging.StreamHandler(sys.stderr)
+            sh.setLevel(logging.INFO)
+            sh.setFormatter(logging.Formatter(fmt))
+            root.addHandler(sh)
+        except OSError:
+            pass
     logger = logging.getLogger("worker")
+    logger.info("Логи воркера также пишутся в %s (при запуске из GUI stderr часто отключён).", log_file)
 
     host = cfg.get("listen_host", "0.0.0.0")
     port = int(cfg.get("listen_port", 50052))
