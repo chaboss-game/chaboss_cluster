@@ -16,10 +16,12 @@ import time
 import yaml
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 import re
 
 from PyQt6 import QtCore, QtGui, QtWidgets
+
+from .tabs import ChatTabWidget, ClusterTabWidget, SettingsTabWidget, WorkerTabWidget
 
 try:
     import grpc
@@ -145,6 +147,7 @@ class MainWindow(QtWidgets.QMainWindow):
     chat_clipboard_set_text = QtCore.pyqtSignal(str)
     chat_clipboard_set_image = QtCore.pyqtSignal(object)
     chat_send_finished = QtCore.pyqtSignal(bool, str)
+    chat_channels_mutation_finished = QtCore.pyqtSignal(bool, str)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
@@ -164,6 +167,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chat_clipboard_set_text.connect(self._chat_set_clipboard_text)
         self.chat_clipboard_set_image.connect(self._chat_set_clipboard_image)
         self.chat_send_finished.connect(self._chat_on_send_finished)
+        self.chat_channels_mutation_finished.connect(self._chat_on_channels_mutation_finished)
 
         settings = load_settings()
         self._addr = (
@@ -171,6 +175,19 @@ class MainWindow(QtWidgets.QMainWindow):
             or os.environ.get("CLUSTER_MASTER_ADDR")
             or settings.get("master_addr", DEFAULT_MASTER_ADDR)
         ).strip()
+        # Если адрес не передан явно, пытаемся взять актуальный из config/master.yaml.
+        if master_addr is None and not os.environ.get("CLUSTER_MASTER_ADDR") and load_master_config is not None:
+            try:
+                project_root = Path(__file__).resolve().parent.parent
+                cfg_path = project_root / "config" / "master.yaml"
+                if cfg_path.exists():
+                    cfg = load_master_config(cfg_path)
+                    cfg_addr = f"{cfg.listen_host}:{cfg.listen_port}".strip()
+                    if cfg_addr:
+                        self._addr = cfg_addr
+            except Exception:
+                # Фолбэк на сохранённый адрес GUI.
+                pass
         self._poller = MasterPoller(self._addr, self)
         self._last_workers_dict: Dict[str, dict] = {}
         self._timer = QtCore.QTimer(self)
@@ -186,330 +203,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_worker_since: Dict[str, int] = {}
 
         self._table_model = WorkerTableModel()
-        table = QtWidgets.QTableView()
-        table.setModel(self._table_model)
-        table.horizontalHeader().setStretchLastSection(True)
+        workers_page = ClusterTabWidget(self, self._table_model, POLL_INTERVAL_MS).build()
 
-        self._addr_label = QtWidgets.QLabel(f"Мастер: {self._addr} (обновление каждые {POLL_INTERVAL_MS // 1000} с)")
+        settings_page = SettingsTabWidget(self, MODEL_LOAD_MODES).build()
 
-        table_container = QtWidgets.QWidget()
-        table_layout = QtWidgets.QVBoxLayout()
-        table_layout.setContentsMargins(0, 0, 0, 0)
-        table_layout.addWidget(self._addr_label)
-        table_layout.addWidget(table)
-        table_container.setLayout(table_layout)
+        chat_tab = ChatTabWidget(self).build()
 
-        log_container = QtWidgets.QWidget()
-        log_layout = QtWidgets.QVBoxLayout()
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(QtWidgets.QLabel("Лог"))
-        self._log_text = QtWidgets.QPlainTextEdit()
-        self._log_text.setReadOnly(True)
-        self._log_text.setPlaceholderText(
-            "События GUI, логи мастера и воркеров (то же, что пишется в файлы на соответствующих узлах)."
-        )
-        log_layout.addWidget(self._log_text)
-        clear_log_btn = QtWidgets.QPushButton("Очистить лог")
-        clear_log_btn.clicked.connect(self._log_text.clear)
-        log_layout.addWidget(clear_log_btn)
-        log_container.setLayout(log_layout)
-
-        # Панель «Режим воркера»: показывается при запущенном воркере вместо таблицы кластера
-        self._worker_panel = QtWidgets.QWidget()
-        worker_panel_layout = QtWidgets.QVBoxLayout()
-        self._worker_status_label = QtWidgets.QLabel("Режим: Воркер\nПорт: —\nСтатус: не запущен")
-        self._worker_status_label.setStyleSheet("font-size: 13px; padding: 12px;")
-        worker_panel_layout.addWidget(self._worker_status_label)
-        worker_panel_layout.addWidget(
-            QtWidgets.QLabel("Мастер подключается к воркерам по своему конфигу. Этот узел ожидает запросы от мастера.")
-        )
-        worker_panel_layout.addStretch()
-        self._worker_panel.setLayout(worker_panel_layout)
-
-        self._worker_master_status_text = ""  # строка для подстановки в панель воркера
-        self._cluster_stack = QtWidgets.QStackedWidget()
-        self._cluster_stack.addWidget(table_container)   # индекс 0: вид «мастер» (таблица воркеров)
-        self._cluster_stack.addWidget(self._worker_panel)  # индекс 1: вид «воркер»
-
-        splitter_main = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        splitter_main.addWidget(self._cluster_stack)
-        splitter_main.addWidget(log_container)
-        splitter_main.setStretchFactor(0, 7)
-        splitter_main.setStretchFactor(1, 3)
-
-        workers_layout = QtWidgets.QVBoxLayout()
-        workers_layout.addWidget(splitter_main)
-        workers_page = QtWidgets.QWidget()
-        workers_page.setLayout(workers_layout)
-
-        # ——— Вкладка «Настройки» ———
-        settings_layout = QtWidgets.QVBoxLayout()
-
-        # Адрес мастера и запуск мастера
-        master_grp = QtWidgets.QGroupBox("Подключение к мастеру")
-        master_layout = QtWidgets.QVBoxLayout()
-        self._master_edit = QtWidgets.QLineEdit()
-        self._master_edit.setPlaceholderText("host:port, например 127.0.0.1:60051")
-        self._master_edit.setText(self._addr)
-        self._master_edit.textChanged.connect(self._schedule_save)
-        master_layout.addWidget(self._master_edit)
-        master_btn_layout = QtWidgets.QHBoxLayout()
-        start_master_btn = QtWidgets.QPushButton("Старт мастера")
-        start_master_btn.setToolTip("Запуск мастера в отдельном процессе (python -m scripts.run_master)")
-        start_master_btn.clicked.connect(self._on_start_master)
-        stop_master_btn = QtWidgets.QPushButton("Остановить мастера")
-        stop_master_btn.clicked.connect(self._on_stop_master)
-        restart_master_btn = QtWidgets.QPushButton("Перезапустить мастера")
-        restart_master_btn.clicked.connect(self._on_restart_master)
-        master_btn_layout.addWidget(start_master_btn)
-        master_btn_layout.addWidget(stop_master_btn)
-        master_btn_layout.addWidget(restart_master_btn)
-        master_layout.addLayout(master_btn_layout)
-        self._master_process: subprocess.Popen | None = None
-        self._start_master_btn = start_master_btn
-        self._stop_master_btn = stop_master_btn
-        self._restart_master_btn = restart_master_btn
-        self._master_grp = master_grp
-        master_grp.setLayout(master_layout)
-        settings_layout.addWidget(master_grp)
-
-        # Режим загрузки модели и использование ресурсов
-        mode_grp = QtWidgets.QGroupBox("Режим загрузки модели")
-        mode_layout = QtWidgets.QVBoxLayout()
-        self._mode_combo = QtWidgets.QComboBox()
-        for value, label in MODEL_LOAD_MODES:
-            self._mode_combo.addItem(label, value)
-        self._mode_combo.currentIndexChanged.connect(self._schedule_save)
-        mode_layout.addWidget(QtWidgets.QLabel("Режим:"))
-        mode_layout.addWidget(self._mode_combo)
-        resource_layout = QtWidgets.QHBoxLayout()
-        resource_layout.addWidget(QtWidgets.QLabel("Использование свободных ресурсов (%):"))
-        self._resource_percent_spin = QtWidgets.QSpinBox()
-        self._resource_percent_spin.setRange(1, 100)
-        self._resource_percent_spin.setValue(75)
-        self._resource_percent_spin.setSuffix(" %")
-        self._resource_percent_spin.valueChanged.connect(self._schedule_save)
-        self._resource_percent_spin.valueChanged.connect(
-            lambda: self._update_resources_label(getattr(self, "_last_workers_dict", {}))
-        )
-        resource_layout.addWidget(self._resource_percent_spin)
-        resource_layout.addStretch()
-        mode_layout.addLayout(resource_layout)
-        self._resources_label = QtWidgets.QLabel("Свободные ресурсы: — (выполните Скан на вкладке Воркеры)")
-        self._resources_label.setWordWrap(True)
-        mode_layout.addWidget(self._resources_label)
-        self._mode_grp = mode_grp
-        mode_grp.setLayout(mode_layout)
-        settings_layout.addWidget(mode_grp)
-
-        # Конфиг воркеров (IP, port, key)
-        workers_grp = QtWidgets.QGroupBox("Конфиг воркеров")
-        w_layout = QtWidgets.QVBoxLayout()
-        self._workers_table = QtWidgets.QTableWidget(0, 3)
-        self._workers_table.setHorizontalHeaderLabels(["IP (host)", "Port", "Key (auth_token)"])
-        self._workers_table.horizontalHeader().setStretchLastSection(True)
-        self._workers_table.cellChanged.connect(self._schedule_save)
-        w_btn_layout = QtWidgets.QHBoxLayout()
-        add_btn = QtWidgets.QPushButton("Добавить")
-        remove_btn = QtWidgets.QPushButton("Удалить")
-        apply_btn = QtWidgets.QPushButton("Применить конфиг на мастере")
-        update_btn = QtWidgets.QPushButton("Обновить воркеры (git pull)")
-        add_btn.clicked.connect(self._add_worker_row)
-        remove_btn.clicked.connect(self._remove_worker_row)
-        apply_btn.clicked.connect(self._on_apply_workers_config)
-        update_btn.clicked.connect(self._on_remote_update_workers)
-        w_btn_layout.addWidget(add_btn)
-        w_btn_layout.addWidget(remove_btn)
-        w_btn_layout.addWidget(apply_btn)
-        w_btn_layout.addWidget(update_btn)
-        w_btn_layout.addStretch()
-        w_layout.addWidget(self._workers_table)
-        w_layout.addLayout(w_btn_layout)
-        self._workers_grp = workers_grp
-        workers_grp.setLayout(w_layout)
-        settings_layout.addWidget(workers_grp)
-
-        # Модель HF и кнопки
-        model_grp = QtWidgets.QGroupBox("Модель и запуск")
-        model_layout = QtWidgets.QVBoxLayout()
-        self._model_edit = QtWidgets.QLineEdit()
-        self._model_edit.setPlaceholderText("например: bert-base-uncased или org/repo")
-        self._model_edit.textChanged.connect(self._schedule_save)
-        scan_btn = QtWidgets.QPushButton("Скан")
-        start_btn = QtWidgets.QPushButton("Старт")
-        unload_btn = QtWidgets.QPushButton("Выгрузить модель")
-        scan_btn.clicked.connect(self._on_scan)
-        start_btn.clicked.connect(self._on_start)
-        unload_btn.clicked.connect(self._on_unload_model)
-        model_layout.addWidget(QtWidgets.QLabel("Модель HuggingFace:"))
-        model_layout.addWidget(self._model_edit)
-        btn_layout = QtWidgets.QHBoxLayout()
-        btn_layout.addWidget(scan_btn)
-        btn_layout.addWidget(start_btn)
-        btn_layout.addWidget(unload_btn)
-        btn_layout.addStretch()
-        model_layout.addLayout(btn_layout)
-        self._model_grp = model_grp
-        model_grp.setLayout(model_layout)
-        settings_layout.addWidget(model_grp)
-
-        settings_layout.addStretch()
-        settings_page = QtWidgets.QWidget()
-        settings_page.setLayout(settings_layout)
-
-        # ——— Вкладка «Чат» ———
-        chat_tab = QtWidgets.QWidget()
-        chat_tab_layout = QtWidgets.QVBoxLayout()
-
-        chat_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-
-        # Панель каналов
-        chat_channels_panel = QtWidgets.QWidget()
-        chat_channels_layout = QtWidgets.QVBoxLayout()
-        chat_channels_layout.addWidget(QtWidgets.QLabel("Канал:"))
-        self._chat_channels_combo = QtWidgets.QComboBox()
-        self._chat_channels_combo.currentIndexChanged.connect(self._chat_on_channel_changed)
-        chat_channels_layout.addWidget(self._chat_channels_combo)
-
-        chat_channels_btns = QtWidgets.QHBoxLayout()
-        add_channel_btn = QtWidgets.QPushButton("Создать")
-        rename_channel_btn = QtWidgets.QPushButton("Переименовать")
-        del_channel_btn = QtWidgets.QPushButton("Удалить")
-        add_channel_btn.clicked.connect(self._chat_create_channel)
-        rename_channel_btn.clicked.connect(self._chat_rename_channel)
-        del_channel_btn.clicked.connect(self._chat_delete_channel)
-        chat_channels_btns.addWidget(add_channel_btn)
-        chat_channels_btns.addWidget(rename_channel_btn)
-        chat_channels_btns.addWidget(del_channel_btn)
-        chat_channels_layout.addLayout(chat_channels_btns)
-        # Получатели — под каналами, чтобы список был хорошо виден
-        chat_channels_layout.addWidget(QtWidgets.QLabel("Получатели (онлайн):"))
-        self._chat_workers_checklist = QtWidgets.QListWidget()
-        self._chat_workers_checklist.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        self._chat_workers_checklist.setMinimumHeight(80)
-        self._chat_workers_checklist.setMaximumHeight(180)
-        chat_channels_layout.addWidget(self._chat_workers_checklist)
-        chat_channels_layout.addStretch()
-        chat_channels_panel.setLayout(chat_channels_layout)
-
-        # Панель сообщений
-        chat_messages_panel = QtWidgets.QWidget()
-        chat_messages_layout = QtWidgets.QVBoxLayout()
-        chat_messages_layout.addWidget(QtWidgets.QLabel("Сообщения:"))
-        self._chat_messages_list = QtWidgets.QListWidget()
-        self._chat_messages_list.currentRowChanged.connect(self._chat_on_message_selected)
-        chat_messages_layout.addWidget(self._chat_messages_list, 1)
-        chat_messages_panel.setLayout(chat_messages_layout)
-
-        # Панель вложений выбранного сообщения
-        chat_attach_panel = QtWidgets.QWidget()
-        chat_attach_layout = QtWidgets.QVBoxLayout()
-        chat_attach_layout.addWidget(QtWidgets.QLabel("Вложения:"))
-        self._chat_attachments_scroll = QtWidgets.QScrollArea()
-        self._chat_attachments_scroll.setWidgetResizable(True)
-        self._chat_attachments_container = QtWidgets.QWidget()
-        self._chat_attachments_layout = QtWidgets.QVBoxLayout()
-        self._chat_attachments_layout.setContentsMargins(6, 6, 6, 6)
-        self._chat_attachments_container.setLayout(self._chat_attachments_layout)
-        self._chat_attachments_scroll.setWidget(self._chat_attachments_container)
-        chat_attach_layout.addWidget(self._chat_attachments_scroll, 1)
-        chat_attach_panel.setLayout(chat_attach_layout)
-
-        chat_split.addWidget(chat_channels_panel)
-        chat_split.addWidget(chat_messages_panel)
-        chat_split.addWidget(chat_attach_panel)
-        chat_split.setStretchFactor(0, 1)
-        chat_split.setStretchFactor(1, 3)
-        chat_split.setStretchFactor(2, 2)
-        # Делаем верхний сплиттер менее "высоким", чтобы нижняя панель "Отправка"
-        # (получатели/кнопка/статус) не уезжала за пределы окна.
-        chat_tab_layout.addWidget(chat_split, 2)
-
-        # Панель отправки: только текст, вложения и кнопка (получатели — под каналами)
-        send_grp = QtWidgets.QGroupBox("Отправка")
-        send_layout = QtWidgets.QVBoxLayout()
-        send_layout.setSpacing(8)
-
-        send_layout.addWidget(QtWidgets.QLabel("Текст:"))
-        self._chat_text_edit = QtWidgets.QTextEdit()
-        self._chat_text_edit.setPlaceholderText("Введите сообщение...")
-        self._chat_text_edit.setMinimumHeight(72)
-        self._chat_text_edit.setMaximumHeight(110)
-        send_layout.addWidget(self._chat_text_edit)
-
-        # Строка «Добавить файлы» + drop — отдельно от поля текста
-        attach_row = QtWidgets.QHBoxLayout()
-        self._chat_add_files_btn = QtWidgets.QPushButton("Добавить файлы")
-        self._chat_add_files_btn.clicked.connect(self._chat_pick_files)
-        self._chat_add_files_btn.setMinimumHeight(30)
-        attach_row.addWidget(self._chat_add_files_btn)
-        self._chat_drop_area = QtWidgets.QFrame()
-        self._chat_drop_area.setFrameShape(QtWidgets.QFrame.Shape.Box)
-        self._chat_drop_area.setAcceptDrops(True)
-        self._chat_drop_area.setToolTip("Перетащите файлы сюда (до 20MB каждый, до 5 штук)")
-        self._chat_drop_area.setMinimumHeight(30)
-        drop_layout = QtWidgets.QVBoxLayout()
-        drop_layout.setContentsMargins(8, 2, 8, 2)
-        self._chat_drop_label = QtWidgets.QLabel("Drag & Drop файлов/фото сюда")
-        drop_layout.addWidget(self._chat_drop_label)
-        self._chat_drop_area.setLayout(drop_layout)
-        self._chat_drop_area.installEventFilter(self)
-        attach_row.addWidget(self._chat_drop_area, 1)
-        send_layout.addLayout(attach_row)
-
-        self._chat_selected_files_label = QtWidgets.QLabel("Выбранные файлы:")
-        send_layout.addWidget(self._chat_selected_files_label)
-        self._chat_selected_files_list = QtWidgets.QListWidget()
-        self._chat_selected_files_list.setMaximumHeight(90)
-        self._chat_selected_files_list.setPlaceholderText("Файлы не выбраны")
-        self._chat_selected_files_label.setVisible(False)
-        self._chat_selected_files_list.setVisible(False)
-        send_layout.addWidget(self._chat_selected_files_list)
-
-        # Кнопка «Отправить» — обычный размер, справа внизу
-        send_btn_row = QtWidgets.QHBoxLayout()
-        send_btn_row.addStretch()
-        self._chat_send_btn = QtWidgets.QPushButton("Отправить")
-        self._chat_send_btn.setMinimumWidth(120)
-        self._chat_send_btn.clicked.connect(self._chat_send_message)
-        send_btn_row.addWidget(self._chat_send_btn)
-        send_layout.addLayout(send_btn_row)
-        self._chat_send_status = QtWidgets.QLabel("")
-        send_layout.addWidget(self._chat_send_status)
-        send_grp.setLayout(send_layout)
-        send_grp.setMinimumHeight(220)
-        # Нижняя панель "Отправка" должна быть видна без скролла.
-        chat_tab_layout.addWidget(send_grp, 1)
-        chat_tab.setLayout(chat_tab_layout)
-
-        # ——— Вкладка «Воркер» ———
-        worker_tab = QtWidgets.QWidget()
-        worker_tab_layout = QtWidgets.QVBoxLayout()
-        worker_cfg_grp = QtWidgets.QGroupBox("Запуск воркера")
-        worker_cfg_layout = QtWidgets.QVBoxLayout()
-        worker_cfg_layout.addWidget(QtWidgets.QLabel("Конфиг воркера (путь относительно корня проекта):"))
-        self._worker_config_edit = QtWidgets.QLineEdit()
-        self._worker_config_edit.setPlaceholderText("config/worker.yaml")
-        self._worker_config_edit.textChanged.connect(self._schedule_save)
-        worker_cfg_layout.addWidget(self._worker_config_edit)
-        worker_btn_layout = QtWidgets.QHBoxLayout()
-        self._start_worker_btn = QtWidgets.QPushButton("Старт воркера")
-        self._start_worker_btn.clicked.connect(self._on_start_worker)
-        self._stop_worker_btn = QtWidgets.QPushButton("Остановить воркера")
-        self._stop_worker_btn.clicked.connect(self._on_stop_worker)
-        self._restart_worker_btn = QtWidgets.QPushButton("Перезапустить воркера")
-        self._restart_worker_btn.clicked.connect(self._on_restart_worker)
-        worker_btn_layout.addWidget(self._start_worker_btn)
-        worker_btn_layout.addWidget(self._stop_worker_btn)
-        worker_btn_layout.addWidget(self._restart_worker_btn)
-        worker_btn_layout.addStretch()
-        worker_cfg_layout.addLayout(worker_btn_layout)
-        worker_cfg_grp.setLayout(worker_cfg_layout)
-        worker_tab_layout.addWidget(worker_cfg_grp)
-        worker_tab_layout.addStretch()
-        worker_tab.setLayout(worker_tab_layout)
-        self._worker_process: subprocess.Popen | None = None
-        self._worker_display_port: int | None = None
+        worker_tab = WorkerTabWidget(self).build()
 
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(workers_page, "Кластер")
@@ -1317,7 +1017,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_poller_error(self, msg: str) -> None:
         self.append_log("Ошибка подключения к мастеру: " + msg)
-        self.statusBar().showMessage(f"Ошибка: {msg}")
+        short = self._chat_format_error(msg)
+        self.statusBar().showMessage(short)
         self._table_model.update_workers({})
         self._last_workers_dict = {}
 
@@ -1498,14 +1199,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 r = stub.MutateChatChannels(req, timeout=10.0)
                 ch.close()
             except Exception as e:
-                self.append_log("Ошибка изменения каналов: %s" % e)
-                QtWidgets.QMessageBox.warning(self, "Чат", "Ошибка изменения каналов: %s" % e)
+                self.chat_channels_mutation_finished.emit(False, str(e))
                 return
-            # reload
-            self._chat_load_channels()
-            QtWidgets.QMessageBox.information(self, "Чат", "Каналы обновлены")
+            self.chat_channels_mutation_finished.emit(bool(r.ok), r.error or "")
 
         threading.Thread(target=do_mutate, daemon=True).start()
+
+    def _chat_on_channels_mutation_finished(self, ok: bool, error: str) -> None:
+        if ok:
+            self._chat_load_channels()
+            QtWidgets.QMessageBox.information(self, "Чат", "Каналы обновлены")
+            return
+        err = self._chat_format_error(error)
+        self.append_log("Ошибка изменения каналов: %s" % err)
+        QtWidgets.QMessageBox.warning(self, "Чат", err)
 
     def _chat_on_channel_changed(self) -> None:
         cid = self._chat_channels_combo.currentData()
@@ -1856,16 +1563,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chat_text_edit.setPlainText("")
             self._chat_pending_attachments = []
             self._chat_refresh_selected_files_list()
+            self._chat_send_status.setStyleSheet("color: #1f7a1f;")
             self._chat_send_status.setText("Отправлено")
             self._chat_poll_history(force=False)
             self.append_log("Чат: сообщение отправлено")
             if error:
                 self.append_log(error)
         else:
-            self._chat_send_status.setText("")
-            if error:
-                self.append_log(error)
-                QtWidgets.QMessageBox.warning(self, "Чат", error)
+            err = self._chat_format_error(error)
+            self._chat_send_status.setStyleSheet("color: #b42318;")
+            self._chat_send_status.setText(err)
+            self.append_log("Чат: ошибка отправки: " + (error or ""))
+            QtWidgets.QMessageBox.warning(self, "Чат", err)
 
     def _chat_send_message(self) -> None:
         if getattr(self, "_chat_send_in_progress", False):
@@ -1926,6 +1635,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._chat_send_btn.setEnabled(False)
+        self._chat_send_status.setStyleSheet("")
         self._chat_send_status.setText("Отправка...")
         self.append_log(f"Чат: отправка сообщения {message_id} (канал={channel_id}, вложений={len(self._chat_pending_attachments)})")
 
@@ -1979,6 +1689,24 @@ class MainWindow(QtWidgets.QMainWindow):
         threading.Thread(target=do_send, daemon=True).start()
 
     # end chat
+
+    def _chat_format_error(self, raw_error: str) -> str:
+        msg = (raw_error or "").strip()
+        if not msg:
+            return "Неизвестная ошибка чата."
+        low = msg.lower()
+        if "statuscode.unavailable" in low or "failed to connect to all addresses" in low:
+            return (
+                "Нет соединения с мастером. Проверьте адрес мастера в настройках и убедитесь, "
+                "что мастер запущен."
+            )
+        if "deadline_exceeded" in low or "deadline exceeded" in low:
+            return "Таймаут запроса к мастеру. Проверьте нагрузку и сетевую доступность."
+        if "statuscode.unimplemented" in low or "method not found" in low:
+            return "Несовместимые версии GUI и мастера. Обновите проект на всех узлах."
+        if len(msg) > 220:
+            return msg[:217] + "..."
+        return msg
 
 
 class WorkerTableModel(QtCore.QAbstractTableModel):
