@@ -1604,9 +1604,45 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self.append_log("Ошибка добавления файла: %s" % e)
 
+        self._chat_refresh_selected_files_list()
+
+    def _chat_remove_pending_attachment(self, attachment_id: str) -> None:
+        aid = (attachment_id or "").strip()
+        if not aid:
+            return
+        self._chat_pending_attachments = [a for a in self._chat_pending_attachments if (a.get("attachment_id") or "") != aid]
+        self._chat_refresh_selected_files_list()
+
+    def _chat_refresh_selected_files_list(self) -> None:
         self._chat_selected_files_list.clear()
         for att in self._chat_pending_attachments:
-            self._chat_selected_files_list.addItem(att.get("filename") or att.get("path") or "file")
+            filename = str(att.get("filename") or att.get("path") or "file")
+            size = int(att.get("size") or 0)
+            size_kb = max(1, size // 1024) if size > 0 else 0
+            aid = str(att.get("attachment_id") or "")
+
+            item = QtWidgets.QListWidgetItem()
+            row = QtWidgets.QWidget()
+            row_l = QtWidgets.QHBoxLayout()
+            row_l.setContentsMargins(6, 2, 6, 2)
+            row_l.setSpacing(6)
+
+            label = QtWidgets.QLabel(f"{filename} ({size_kb} KB)")
+            label.setToolTip(att.get("path") or filename)
+            label.setWordWrap(False)
+            row_l.addWidget(label, 1)
+
+            remove_btn = QtWidgets.QToolButton()
+            remove_btn.setText("×")
+            remove_btn.setToolTip("Убрать файл из отправки")
+            remove_btn.clicked.connect(lambda _=False, x=aid: self._chat_remove_pending_attachment(x))
+            row_l.addWidget(remove_btn, 0)
+
+            row.setLayout(row_l)
+            item.setSizeHint(row.sizeHint())
+            self._chat_selected_files_list.addItem(item)
+            self._chat_selected_files_list.setItemWidget(item, row)
+
         has_files = len(self._chat_pending_attachments) > 0
         self._chat_selected_files_label.setVisible(has_files)
         self._chat_selected_files_list.setVisible(has_files)
@@ -1819,9 +1855,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok:
             self._chat_text_edit.setPlainText("")
             self._chat_pending_attachments = []
-            self._chat_selected_files_list.clear()
-            self._chat_selected_files_label.setVisible(False)
-            self._chat_selected_files_list.setVisible(False)
+            self._chat_refresh_selected_files_list()
             self._chat_send_status.setText("Отправлено")
             self._chat_poll_history(force=False)
             self.append_log("Чат: сообщение отправлено")
