@@ -536,6 +536,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             # чеклист может ещё не быть создан (на ранней стадии init)
             pass
+        btn = getattr(self, "_chat_refresh_receivers_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
 
     def _update_process_state(self) -> None:
         """Обновить вид кластера и блокировки: мастер и воркер взаимоисключающие."""
@@ -1000,6 +1003,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._table_model.update_workers(workers)
         n = len(workers)
         self.statusBar().showMessage(f"Воркеров: {n}")
+        btn = getattr(self, "_chat_refresh_receivers_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
 
         # Лог: подключения, отключения, смена статуса
         for key in workers:
@@ -1268,17 +1274,57 @@ class MainWindow(QtWidgets.QMainWindow):
         # 2) показать мастер как опцию (сообщение всё равно сохраняется в мастере).
         worker_mode = getattr(self, "_worker_process", None) is not None and self._worker_process.poll() is None
         master_key = getattr(self, "_addr", "") or ""
-        if worker_mode and master_key and master_key not in workers:
-            workers = dict(workers)
-            workers[master_key] = {
-                "status": "ONLINE",
-                "token_status": "",
-                "os": "",
-                "cpu_cores": 0,
-                "ram_total_mb": 0,
-                "ram_available_mb": 0,
-                "gpus": [],
-            }
+        if worker_mode and master_key:
+            # На Windows в registry/реестре может использоваться другой host (например, `0.0.0.0` vs `127.0.0.1`),
+            # поэтому принудительно показываем мастер ONLINE по совпадению порта.
+            master_port: int | None = None
+            try:
+                _, port_s = str(master_key).rsplit(":", 1)
+                port_s = port_s.strip()
+                if port_s.isdigit():
+                    master_port = int(port_s)
+            except Exception:
+                master_port = None
+
+            if master_port is not None:
+                matching_keys = [k for k in workers.keys() if str(k).endswith(f":{master_port}")]
+                online_matching_keys = [
+                    k
+                    for k in matching_keys
+                    if (workers.get(k, {}).get("status") or "").upper() == "ONLINE"
+                ]
+                if not online_matching_keys:
+                    workers = dict(workers)
+                    if matching_keys:
+                        # Переопределяем статус у уже существующей записи на тот же port,
+                        # чтобы не плодить дубли в чеклисте.
+                        k0 = matching_keys[0]
+                        w0 = dict(workers.get(k0) or {})
+                        w0["status"] = "ONLINE"
+                        workers[k0] = w0
+                    else:
+                        workers[master_key] = {
+                            "status": "ONLINE",
+                            "token_status": "",
+                            "os": "",
+                            "cpu_cores": 0,
+                            "ram_total_mb": 0,
+                            "ram_available_mb": 0,
+                            "gpus": [],
+                        }
+            else:
+                # Fallback: если не смогли извлечь порт, работаем по точному `master_key`.
+                workers = dict(workers)
+                w0 = dict(workers.get(master_key) or {})
+                if not w0 or (w0.get("status") or "").upper() != "ONLINE":
+                    w0["status"] = "ONLINE"
+                    w0.setdefault("token_status", "")
+                    w0.setdefault("os", "")
+                    w0.setdefault("cpu_cores", 0)
+                    w0.setdefault("ram_total_mb", 0)
+                    w0.setdefault("ram_available_mb", 0)
+                    w0.setdefault("gpus", [])
+                    workers[master_key] = w0
         # Сохраняем выбранные ключи, чтобы не сбрасывать галочки при обновлении списка
         checked_keys: set = set()
         for i in range(self._chat_workers_checklist.count()):
@@ -1304,6 +1350,24 @@ class MainWindow(QtWidgets.QMainWindow):
             item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
             self._chat_workers_checklist.addItem(item)
         self._chat_workers_checklist.blockSignals(False)
+
+    def _chat_refresh_receivers(self) -> None:
+        """
+        Принудительно обновить список получателей (чеклист ONLINE).
+
+        В режиме "Воркер" делаем один опрос через `_poll_worker_visibility`,
+        в режиме "Мастер" — запускаем `MasterPoller.poll()` в фоне.
+        """
+        btn = getattr(self, "_chat_refresh_receivers_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+
+        worker_process = getattr(self, "_worker_process", None)
+        if worker_process is not None and worker_process.poll() is None:
+            self._poll_worker_visibility()
+            return
+
+        threading.Thread(target=self._poller.poll, daemon=True).start()
 
     def _chat_add_attachments(self, paths: List[str]) -> None:
         if not paths:
