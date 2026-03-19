@@ -474,8 +474,11 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         spec = request.spec
         shard_id = f"{spec.model_id}:{spec.shard_id}"
         logger.info(
-            "InitShard: получена команда — model_id=%s, shard_id=%s, source=%s",
+            "InitShard: получена команда — worker=%s:%s model_id=%s shard_id=%s source=%s shard_keys_count=%d",
+            self._host,
+            self._port,
             spec.model_id, spec.shard_id, request.weight_source,
+            len(request.shard_keys) if request.shard_keys is not None else 0,
         )
         try:
             if request.weight_source == "inline_blob":
@@ -547,33 +550,65 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 except ImportError as e:
                     return cluster_pb2.InitShardResponse(ok=False, error=f"hf_download недоступен: {e}")
 
+                shard_keys = list(request.shard_keys) if request.shard_keys else []
                 def on_progress(percent: float, bytes_done: int, bytes_total: int, current_file: str) -> None:
+                    # Чтобы не спамить лог, выводим только при заметных изменениях.
+                    # (Именно логов часто не хватает, когда процесс падает после прогресса.)
+                    p_int = min(100, int(percent or 0))
+                    do_log = False
+                    if not hasattr(on_progress, "_last_percent"):
+                        setattr(on_progress, "_last_percent", -1)
+                        setattr(on_progress, "_last_file", "")
+                    last_percent = getattr(on_progress, "_last_percent")
+                    last_file = getattr(on_progress, "_last_file")
+                    if p_int >= 100 or p_int - last_percent >= 10 or current_file != last_file:
+                        do_log = True
+                        setattr(on_progress, "_last_percent", p_int)
+                        setattr(on_progress, "_last_file", current_file or "")
+
                     with self._load_progress_lock:
                         self._load_progress = {
                             "stage": "download",
-                            "percent": min(100, int(percent)),
+                            "percent": p_int,
                             "bytes_downloaded": bytes_done,
                             "bytes_total": bytes_total,
                             "current_file": current_file,
                         }
+                    if do_log:
+                        logger.info(
+                            "InitShard[%s]: hf download progress percent=%d file=%s bytes=%d/%d",
+                            shard_id,
+                            p_int,
+                            current_file or "",
+                            bytes_done,
+                            bytes_total,
+                        )
 
                 try:
                     with self._load_progress_lock:
                         self._load_progress = {"stage": "download", "percent": 0, "bytes_downloaded": 0, "bytes_total": 0, "current_file": ""}
-                    logger.info("Начало скачивания с HuggingFace (с прогрессом)...")
+                    logger.info(
+                        "InitShard[%s]: start hf_download repo=%s keys_filter=%s (keys=%d)",
+                        shard_id,
+                        request.hf_model_name,
+                        "ON" if shard_keys else "OFF",
+                        len(shard_keys),
+                    )
                     path = download_repo_with_progress(
                         request.hf_model_name,
                         progress_callback=on_progress,
                     )
-                    logger.info("Артефакты модели скачаны в кэш: %s", path)
-                    shard_keys = list(request.shard_keys) if request.shard_keys else []
+                    logger.info("InitShard[%s]: hf artifacts downloaded to: %s", shard_id, path)
                     if shard_keys:
-                        logger.info("Получены metки шарда (keys=%d). Загружаем только нужные тензоры...", len(shard_keys))
+                        logger.info("InitShard[%s]: loading state_dict with filtered keys=%d", shard_id, len(shard_keys))
+                    else:
+                        logger.info("InitShard[%s]: loading state_dict without keys filter (may be heavy)", shard_id)
                     state_dict = load_state_dict_from_dir(path, request.hf_model_name, keys=shard_keys or None)
                 finally:
                     with self._load_progress_lock:
                         self._load_progress = None
 
+                logger.info("InitShard[%s]: state_dict loaded tensors=%d", shard_id, len(state_dict) if isinstance(state_dict, dict) else -1)
                 logger.info("state_dict загружен из кэша HF, ключей=%d", len(state_dict))
 
                 # На больших моделях важно не держать полный state_dict в памяти.
@@ -591,8 +626,10 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
 
                 num_keys = len(state_dict)
                 if state_dict and spec.model_id:
+                    logger.info("InitShard[%s]: trying build layers module for model_id=%s", shard_id, spec.model_id)
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
+                        logger.info("InitShard[%s]: layers module built type=%s", shard_id, type(module).__name__)
                         self._shard_modules[shard_id] = module
                         # Не держим state_dict в _shards — модуль уже содержит веса.
                         # Иначе пик памяти 2x (state_dict + модуль) и на Windows срабатывает os error 1455.
@@ -603,6 +640,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     else:
+                        logger.info("InitShard[%s]: layers module NOT built; keeping raw weights keys=%d", shard_id, num_keys)
                         self._shards[shard_id] = state_dict
                 else:
                     self._shards[shard_id] = state_dict
@@ -613,6 +651,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     approx_bytes / (1024 * 1024) if approx_bytes else 0.0,
                     elapsed,
                 )
+                logger.info("InitShard[%s]: finished ok=%s elapsed=%.2fs", shard_id, True, elapsed)
             elif request.weight_source == "hf_stream" and request.hf_model_name:
                 logger.info("InitShard streaming: HF=%s shard_id=%s", request.hf_model_name, spec.shard_id)
                 try:

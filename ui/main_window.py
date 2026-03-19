@@ -811,6 +811,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_progress_master.setValue(0)
         for bar in self._load_worker_bars.values():
             bar.setValue(0)
+        # Отключаем повторные действия во время загрузки модели.
+        # (Нужно, чтобы пользователь не случайно запустил повторный цикл загрузки.)
+        model_grp_enabled = getattr(getattr(self, "_model_grp", None), "isEnabled", lambda: True)()
+        if hasattr(self, "_start_model_btn") and self._start_model_btn is not None:
+            self._start_model_btn.setEnabled(False)
+        if hasattr(self, "_unload_model_btn") and self._unload_model_btn is not None:
+            self._unload_model_btn.setEnabled(False)
         self._model_edit.setEnabled(False)
         QtWidgets.QApplication.processEvents()
 
@@ -834,6 +841,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 channel = grpc.insecure_channel(self._addr)
                 stub = cluster_pb2_grpc.MasterAdminServiceStub(channel)
+                self.log_message.emit("GUI: вызов LoadModelStream(model_id=%s)" % model_id)
                 try:
                     stream = stub.LoadModelStream(
                         cluster_pb2.LoadModelRequest(hf_model_id=model_id),
@@ -841,13 +849,29 @@ class MainWindow(QtWidgets.QMainWindow):
                     first_event = True
                     for ev in stream:
                         if first_event:
-                            self.log_message.emit("Первый ответ от мастера получен, отображение прогресса.")
+                            stage = (ev.master.stage or "download") if ev.master else "download"
+                            pct = int(ev.master.percent) if ev.master and ev.master.percent is not None else 0
+                            cur_file = (ev.master.current_file or "") if ev.master else ""
+                            self.log_message.emit(
+                                f"GUI: первый progress-ev от мастера: stage={stage} percent={pct} file={cur_file}"
+                            )
                             first_event = False
+                            # Примечание: это лог на уровне GUI, без protobuf-разбора для protobuf-объекта.
+                            # Стадию/проценты дальше покажет progress-bar, а подробные шаги появятся в remote-логах.
+                            self.load_progress_event.emit(_ev_to_dict(ev))
+                            if ev.done:
+                                self.load_finished.emit(ev.ok, ev.error or "")
+                                break
+                            continue
                         self.load_progress_event.emit(_ev_to_dict(ev))
                         if ev.done:
+                            self.log_message.emit("GUI: LoadModelStream done ok=%s error=%s" % (bool(ev.ok), (ev.error or "")[:200]))
                             self.load_finished.emit(ev.ok, ev.error or "")
                             break
                 except grpc.RpcError as rpc_err:
+                    details = rpc_err.details() or ""
+                    code_name = rpc_err.code().name if hasattr(rpc_err, "code") and callable(getattr(rpc_err, "code", None)) else str(rpc_err.code())
+                    self.log_message.emit(f"GUI: ошибка LoadModelStream RPC code={code_name} details={(details[:300] or '')}")
                     if rpc_err.code() == grpc.StatusCode.UNIMPLEMENTED or "Method not found" in (rpc_err.details() or ""):
                         self.log_message.emit("Мастер без LoadModelStream, используется загрузка без прогресса (LoadModel).")
                         self.load_progress_event.emit({
@@ -963,6 +987,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_load_finished(self, ok: bool, error: str) -> None:
         self._model_edit.setEnabled(True)
+        # Возвращаем кнопки в исходное состояние после завершения загрузки.
+        model_grp_enabled = getattr(getattr(self, "_model_grp", None), "isEnabled", lambda: True)()
+        if hasattr(self, "_start_model_btn") and self._start_model_btn is not None:
+            self._start_model_btn.setEnabled(bool(model_grp_enabled))
+        if hasattr(self, "_unload_model_btn") and self._unload_model_btn is not None:
+            self._unload_model_btn.setEnabled(bool(model_grp_enabled))
         if ok:
             self._load_progress_master.setValue(100)
             for bar in self._load_worker_bars.values():

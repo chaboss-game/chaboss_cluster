@@ -431,6 +431,7 @@ class MasterNode:
         model_id: конкретная модель или None/"" — выгрузить текущую загруженную модель.
         Возвращает (ok, error_message).
         """
+        logger.info("unload_model: start (requested model_id=%r)", model_id)
         with self._lock:
             worker_keys = list(self._stubs.keys())
         if not worker_keys:
@@ -438,6 +439,7 @@ class MasterNode:
         mid = (model_id or "").strip() or self._last_loaded_model_id
         if not mid:
             return True, ""
+        logger.info("unload_model: unloading model_id=%s from %d workers", mid, len(worker_keys))
         errors: list[str] = []
         for key in worker_keys:
             stub = self._stubs.get(key)
@@ -448,15 +450,21 @@ class MasterNode:
             # случайно оставить старые шарды, что приводит к крашам воркера при повторном старте.
             req = cluster_pb2.UnloadShardRequest(model_id=mid, shard_id="")
             try:
+                logger.info("unload_model: calling UnloadShard on worker=%s model_id=%s", key, mid)
                 resp = stub.UnloadShard(req, timeout=30.0)
                 if not resp.ok:
                     errors.append(f"{key}: {resp.error}")
+                    logger.warning("unload_model: UnloadShard failed worker=%s model_id=%s error=%s", key, mid, resp.error)
+                else:
+                    logger.info("unload_model: UnloadShard ok worker=%s model_id=%s", key, mid)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{key}: {e}")
+                logger.warning("unload_model: exception worker=%s model_id=%s exc=%s", key, mid, e, exc_info=True)
         if mid == self._last_loaded_model_id:
             self._last_loaded_model_id = None
         if errors:
             return False, "; ".join(errors)
+        logger.info("unload_model: done ok model_id=%s", mid)
         return True, ""
 
     def load_model(self, hf_model_id: str) -> tuple[bool, str]:
@@ -558,6 +566,9 @@ class MasterNode:
         """
         from cluster_core.master.model_loader import prepare_shard_keys, prepare_layer_ranges
 
+        load_run_id = uuid.uuid4().hex[:8]
+        logger.info("load_model_with_progress[%s]: start hf_model_id=%s", load_run_id, hf_model_id)
+
         def make_master_progress(stage: str, percent: int, bytes_done: int = 0, bytes_total: int = 0, current_file: str = "") -> cluster_pb2.LoadProgress:
             return cluster_pb2.LoadProgress(
                 stage=stage,
@@ -578,16 +589,21 @@ class MasterNode:
         try:
             # Сразу отправляем первое событие, чтобы GUI не висел в ожидании (unload может быть долгим).
             progress_queue.put(make_event(make_master_progress("unload", 0), {}))
+            logger.info("load_model_with_progress[%s]: unloading previous model (if any)", load_run_id)
             self.unload_model(None)
+            logger.info("load_model_with_progress[%s]: unload step finished", load_run_id)
             with self._lock:
                 worker_keys = list(self._stubs.keys())
                 stubs_snapshot = dict(self._stubs)
             if not worker_keys:
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="Нет подключённых воркеров"))
+                logger.warning("load_model_with_progress[%s]: no connected workers", load_run_id)
                 return
+            logger.info("load_model_with_progress[%s]: connected workers=%d", load_run_id, len(worker_keys))
             bad = [k for k, wd in self._registry.all().items() if (wd.token_status or "") == "MISMATCH"]
             if bad:
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))))
+                logger.warning("load_model_with_progress[%s]: token mismatch workers=%s", load_run_id, bad)
                 return
 
             # Сразу эмитим начальное событие, чтобы в GUI отобразился прогресс-бар.
@@ -610,10 +626,23 @@ class MasterNode:
                 with self._lock:
                     stubs_snapshot = {k: stubs_snapshot[k] for k in worker_keys if k in stubs_snapshot}
                 progress_queue.put(make_event(make_master_progress("plan", 100), {}))
+                logger.info(
+                    "load_model_with_progress[%s]: streaming_chunks plan ready shards=%d worker_keys=%d shard_ids=%s",
+                    load_run_id,
+                    len(shard_id_list),
+                    len(worker_keys),
+                    shard_id_list,
+                )
             else:
                 shard_keys_list = prepare_shard_keys(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
                 shard_id_list = [str(i) for i in range(len(worker_keys))]
                 progress_queue.put(make_event(make_master_progress("sharding", 100), {}))
+                logger.info(
+                    "load_model_with_progress[%s]: fit_in_cluster sharding ready shards=%d shard_key_counts=%s",
+                    load_run_id,
+                    len(shard_id_list),
+                    [len(x) for x in shard_keys_list],
+                )
 
             errors: list[str] = []
             workers_progress: Dict[str, cluster_pb2.LoadProgress] = {}
@@ -621,10 +650,18 @@ class MasterNode:
                 stub = stubs_snapshot.get(key)
                 if stub is None:
                     errors.append(f"{key}: нет соединения")
+                    logger.warning("load_model_with_progress[%s]: stub missing for worker=%s", load_run_id, key)
                     continue
                 shard_id = shard_id_list[i] if i < len(shard_id_list) else str(i)
                 shard_keys = shard_keys_list[i] if (shard_keys_list is not None and i < len(shard_keys_list)) else []
                 wid = _parse_worker_id(key)
+                logger.info(
+                    "load_model_with_progress[%s]: worker=%s init shard=%s keys=%d",
+                    load_run_id,
+                    key,
+                    shard_id,
+                    len(shard_keys) if shard_keys is not None else 0,
+                )
                 req = cluster_pb2.InitShardRequest(
                     spec=cluster_pb2.ShardSpec(model_id=hf_model_id, shard_id=shard_id, backend="baseline"),
                     weight_source="hf_stream" if mode == "streaming_chunks" else "hf",
@@ -637,25 +674,60 @@ class MasterNode:
 
                 def do_init() -> None:
                     try:
+                        logger.info("load_model_with_progress[%s]: calling InitShard RPC worker=%s shard=%s", load_run_id, key, shard_id)
                         result[0] = stub.InitShard(req, timeout=INIT_SHARD_TIMEOUT_S)
                     except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "load_model_with_progress[%s]: InitShard RPC exception worker=%s shard=%s exc=%s",
+                            load_run_id,
+                            key,
+                            shard_id,
+                            e,
+                            exc_info=True,
+                        )
                         result[1] = e
 
                 t = threading.Thread(target=do_init)
                 t.start()
                 worker_id_pb = cluster_pb2.WorkerId(host=wid.host, port=wid.port)
+                last_logged = {"percent": -1, "stage": "", "current_file": ""}
                 while t.is_alive():
                     time.sleep(0.25)
                     try:
                         r = stub.GetLoadProgress(worker_id_pb, timeout=2.0)
                         if r.progress:
                             workers_progress[key] = r.progress
+                            p_int = int(r.progress.percent or 0)
+                            stage = r.progress.stage or ""
+                            cur_file = r.progress.current_file or ""
+                            # Логируем только при существенных изменениях, чтобы не утопить буфер.
+                            if (
+                                p_int != last_logged["percent"]
+                                and (p_int >= 100 or (p_int - last_logged["percent"] >= 10))
+                            ) or (stage != last_logged["stage"] or cur_file != last_logged["current_file"]):
+                                logger.info(
+                                    "load_model_with_progress[%s]: progress worker=%s shard=%s stage=%s percent=%d file=%s",
+                                    load_run_id,
+                                    key,
+                                    shard_id,
+                                    stage,
+                                    p_int,
+                                    cur_file,
+                                )
+                                last_logged = {"percent": p_int, "stage": stage, "current_file": cur_file}
                             progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
                     except Exception:  # noqa: S110
                         pass
                 t.join()
                 if result[0] and not result[0].ok:
                     errors.append(f"{key}: {result[0].error}")
+                    logger.warning(
+                        "load_model_with_progress[%s]: InitShard finished ok=False worker=%s shard=%s error=%s",
+                        load_run_id,
+                        key,
+                        shard_id,
+                        result[0].error,
+                    )
                 elif result[0] is None:
                     exc = result[1]
                     if exc is None:
@@ -669,14 +741,29 @@ class MasterNode:
                                 pass
                         logger.warning("InitShard failed for %s: %s", key, exc, exc_info=True)
                     errors.append(f"{key}: {err_detail}")
+                    logger.warning(
+                        "load_model_with_progress[%s]: InitShard finished with exception worker=%s shard=%s exc_detail=%s",
+                        load_run_id,
+                        key,
+                        shard_id,
+                        err_detail,
+                    )
                 workers_progress[key] = cluster_pb2.LoadProgress(stage="done", percent=100)
                 progress_queue.put(make_event(make_master_progress("workers", 100), dict(workers_progress)))
+                logger.info(
+                    "load_model_with_progress[%s]: worker shard done worker=%s shard=%s",
+                    load_run_id,
+                    key,
+                    shard_id,
+                )
 
             if errors:
+                logger.error("load_model_with_progress[%s]: FAILED errors=%s", load_run_id, errors)
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="; ".join(errors)))
                 return
             self._last_loaded_model_id = hf_model_id
             self._last_loaded_shard_ids = shard_id_list
+            logger.info("load_model_with_progress[%s]: SUCCESS hf_model_id=%s shard_ids=%s", load_run_id, hf_model_id, shard_id_list)
             progress_queue.put(make_event(None, {}, done=True, ok=True, error=""))
         except Exception as e:  # noqa: BLE001
             logger.exception("load_model_with_progress failed: %s", e)

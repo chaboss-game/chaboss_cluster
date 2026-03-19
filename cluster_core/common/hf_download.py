@@ -124,7 +124,16 @@ def load_state_dict_from_dir(
     import torch
     path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
     state_dict = None
+    keys_list = list(keys) if keys is not None else None
+    if keys_list is not None:
+        logger.info(
+            "load_state_dict_from_dir: path=%s model_id=%s keys_filter=ON requested=%d",
+            str(path),
+            model_id or "",
+            len(keys_list),
+        )
     if (path / "pytorch_model.bin").exists():
+        logger.info("load_state_dict_from_dir: loading pytorch_model.bin from %s", str(path))
         state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
         if not isinstance(state_dict, dict):
             state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
@@ -132,16 +141,19 @@ def load_state_dict_from_dir(
         try:
             from safetensors import safe_open
             # Если keys задан, читаем только нужные тензоры без загрузки всей модели в RAM.
-            if keys is not None:
-                want = set(keys)
+            if keys_list is not None:
+                want = set(keys_list)
                 state_dict = {}
+                logger.info("load_state_dict_from_dir: reading model.safetensors filtered wanted=%d", len(want))
                 with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
                     for k in f.keys():
                         if k in want:
                             state_dict[k] = f.get_tensor(k)
+                logger.info("load_state_dict_from_dir: model.safetensors filtered found=%d", len(state_dict))
                 # Если в этом файле ничего не нашли — оставим пустой dict, дальше не падаем.
             else:
                 from safetensors.torch import load_file
+                logger.info("load_state_dict_from_dir: reading full model.safetensors (may be heavy)")
                 state_dict = load_file(str(path / "model.safetensors"))
         except ImportError:
             raise RuntimeError("Установите safetensors: pip install safetensors")
@@ -151,28 +163,42 @@ def load_state_dict_from_dir(
             try:
                 from safetensors import safe_open
                 state_dict = {}
-                want = set(keys) if keys is not None else None
+                want = set(keys_list) if keys_list is not None else None
                 for sf in st_files:
                     if want is None:
                         from safetensors.torch import load_file
+                        logger.info("load_state_dict_from_dir: reading full safetensors file=%s", str(sf))
                         state_dict.update(load_file(str(sf)))
                         continue
+                    logger.info(
+                        "load_state_dict_from_dir: reading safetensors filtered file=%s wanted=%d",
+                        str(sf),
+                        len(want),
+                    )
+                    before = len(state_dict)
                     with safe_open(str(sf), framework="pt", device="cpu") as f:
                         # Итерируем ключи файла (без загрузки тензоров) и забираем только нужные.
                         for k in f.keys():
                             if k in want:
                                 state_dict[k] = f.get_tensor(k)
+                    logger.info(
+                        "load_state_dict_from_dir: safetensors filtered file=%s found_new=%d total_now=%d",
+                        str(sf),
+                        len(state_dict) - before,
+                        len(state_dict),
+                    )
             except ImportError:
                 raise RuntimeError("Установите safetensors: pip install safetensors")
         else:
             bin_files = list(path.glob("*.bin"))
             if bin_files:
+                logger.info("load_state_dict_from_dir: loading .bin files from %s (first=%s)", str(path), str(bin_files[0]))
                 state_dict = torch.load(bin_files[0], map_location="cpu", weights_only=True)
                 if not isinstance(state_dict, dict):
                     state_dict = getattr(state_dict, "state_dict", lambda: state_dict)()
-    if state_dict is not None and keys is not None:
+    if state_dict is not None and keys_list is not None:
         # Для .bin (и некоторых нетипичных случаев) всё равно могло загрузиться много — фильтруем.
-        want = set(keys)
+        want = set(keys_list)
         if not isinstance(state_dict, dict):
             raise TypeError("Ожидался state_dict (dict)")
         state_dict = {k: v for k, v in state_dict.items() if k in want}

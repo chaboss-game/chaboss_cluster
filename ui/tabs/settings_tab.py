@@ -109,6 +109,9 @@ class SettingsTabWidget:
         scan_btn.clicked.connect(owner._on_scan)
         start_btn.clicked.connect(owner._on_start)
         unload_btn.clicked.connect(owner._on_unload_model)
+        # Для управления состоянием кнопок во время загрузки
+        owner._start_model_btn = start_btn
+        owner._unload_model_btn = unload_btn
         model_layout.addWidget(QtWidgets.QLabel("Модель HuggingFace:"))
         model_layout.addWidget(owner._model_edit)
         btn_layout = QtWidgets.QHBoxLayout()
