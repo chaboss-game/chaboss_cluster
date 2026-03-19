@@ -1201,23 +1201,27 @@ class MainWindow(QtWidgets.QMainWindow):
         def do_mutate() -> None:
             try:
                 ch = grpc.insecure_channel(addr)
-                stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
-                req = cluster_pb2.ChatChannelsMutationRequest(
-                    ops=[
-                        cluster_pb2.ChatChannelMutation(
-                            type=o["type"],
-                            channel_id=o["channel_id"],
-                            name=o.get("name") or "",
-                        )
-                        for o in ops
-                    ]
-                )
-                r = stub.MutateChatChannels(req, timeout=10.0)
-                ch.close()
+                try:
+                    stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
+                    req = cluster_pb2.ChatChannelsMutationRequest(
+                        ops=[
+                            cluster_pb2.ChatChannelMutation(
+                                type=o["type"],
+                                channel_id=o["channel_id"],
+                                name=o.get("name") or "",
+                            )
+                            for o in ops
+                        ]
+                    )
+                    # ChatChannelsResponse содержит только список `channels`,
+                    # поэтому признак успеха определяется фактом отсутствия RPC-ошибки.
+                    stub.MutateChatChannels(req, timeout=10.0)
+                finally:
+                    ch.close()
             except Exception as e:
                 self.chat_channels_mutation_finished.emit(False, str(e))
                 return
-            self.chat_channels_mutation_finished.emit(bool(r.ok), r.error or "")
+            self.chat_channels_mutation_finished.emit(True, "")
 
         threading.Thread(target=do_mutate, daemon=True).start()
 
