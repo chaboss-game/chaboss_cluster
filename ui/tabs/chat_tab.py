@@ -65,6 +65,10 @@ class ChatTabWidget:
         chat_messages_layout = QtWidgets.QVBoxLayout()
         chat_messages_layout.addWidget(QtWidgets.QLabel("Сообщения:"))
         owner._chat_messages_list = QtWidgets.QListWidget()
+        # Длинные сообщения должны переноситься, а не скроллиться по X.
+        owner._chat_messages_list.setWordWrap(True)
+        owner._chat_messages_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        owner._chat_messages_list.setUniformItemSizes(False)
         owner._chat_messages_list.currentRowChanged.connect(owner._chat_on_message_selected)
         chat_messages_layout.addWidget(owner._chat_messages_list, 1)
         chat_messages_panel.setLayout(chat_messages_layout)

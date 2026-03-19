@@ -1313,56 +1313,20 @@ class MainWindow(QtWidgets.QMainWindow):
         worker_mode = getattr(self, "_worker_process", None) is not None and self._worker_process.poll() is None
         master_key = getattr(self, "_addr", "") or ""
         if worker_mode and master_key:
-            # На Windows в registry/реестре может использоваться другой host (например, `0.0.0.0` vs `127.0.0.1`),
-            # поэтому принудительно показываем мастер ONLINE по совпадению порта.
-            master_port: int | None = None
-            try:
-                _, port_s = str(master_key).rsplit(":", 1)
-                port_s = port_s.strip()
-                if port_s.isdigit():
-                    master_port = int(port_s)
-            except Exception:
-                master_port = None
-
-            if master_port is not None:
-                matching_keys = [k for k in workers.keys() if str(k).endswith(f":{master_port}")]
-                online_matching_keys = [
-                    k
-                    for k in matching_keys
-                    if (workers.get(k, {}).get("status") or "").upper() == "ONLINE"
-                ]
-                if not online_matching_keys:
-                    workers = dict(workers)
-                    if matching_keys:
-                        # Переопределяем статус у уже существующей записи на тот же port,
-                        # чтобы не плодить дубли в чеклисте.
-                        k0 = matching_keys[0]
-                        w0 = dict(workers.get(k0) or {})
-                        w0["status"] = "ONLINE"
-                        workers[k0] = w0
-                    else:
-                        workers[master_key] = {
-                            "status": "ONLINE",
-                            "token_status": "",
-                            "os": "",
-                            "cpu_cores": 0,
-                            "ram_total_mb": 0,
-                            "ram_available_mb": 0,
-                            "gpus": [],
-                        }
-            else:
-                # Fallback: если не смогли извлечь порт, работаем по точному `master_key`.
-                workers = dict(workers)
-                w0 = dict(workers.get(master_key) or {})
-                if not w0 or (w0.get("status") or "").upper() != "ONLINE":
-                    w0["status"] = "ONLINE"
-                    w0.setdefault("token_status", "")
-                    w0.setdefault("os", "")
-                    w0.setdefault("cpu_cores", 0)
-                    w0.setdefault("ram_total_mb", 0)
-                    w0.setdefault("ram_available_mb", 0)
-                    w0.setdefault("gpus", [])
-                    workers[master_key] = w0
+            # Безопасная логика для чеклиста в режиме "воркер":
+            # - не удаляем ничего из реестра (чтобы не получить пустой чеклист из-за совпадений портов),
+            # - гарантируем запись мастера под точным ключом `_addr`,
+            # - мастер помечаем ONLINE.
+            workers = dict(workers)
+            w_master = dict(workers.get(master_key) or {})
+            w_master["status"] = "ONLINE"
+            w_master.setdefault("token_status", "")
+            w_master.setdefault("os", "")
+            w_master.setdefault("cpu_cores", 0)
+            w_master.setdefault("ram_total_mb", 0)
+            w_master.setdefault("ram_available_mb", 0)
+            w_master.setdefault("gpus", [])
+            workers[master_key] = w_master
         # Сохраняем выбранные ключи, чтобы не сбрасывать галочки при обновлении списка
         checked_keys: set = set()
         for i in range(self._chat_workers_checklist.count()):
@@ -1378,7 +1342,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Иначе можем случайно пропустить мастер-опцию, которую мы добавляем вручную ниже.
             if self_key and str(key).strip() == self_key and str(key).strip() in original_worker_keys:
                 continue
-            if (w.get("status") or "").upper() != "ONLINE":
+            status_val = w.get("status")
+            if str(status_val or "").strip().upper() != "ONLINE":
                 continue
             item = QtWidgets.QListWidgetItem(key)
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
@@ -1644,8 +1609,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 time_str = dt.strftime("%d.%m.%Y %H:%M")
             except Exception:
                 time_str = ""
-            preview = (text[:60] + ("..." if len(text) > 60 else "")) if text else "(без текста)"
-            item = QtWidgets.QListWidgetItem(f"[{time_str}] {sender}: {preview}")
+            msg_text = text if text else "(без текста)"
+            # Полный текст должен отображаться с переносами строк (без горизонтального скролла).
+            item = QtWidgets.QListWidgetItem(f"[{time_str}] {sender}:\n{msg_text}")
             # иконка для первого изображения
             icon_pixmap = None
             for a in m.get("attachments") or []:

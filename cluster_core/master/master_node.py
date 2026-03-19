@@ -439,11 +439,14 @@ class MasterNode:
         if not mid:
             return True, ""
         errors: list[str] = []
-        for i, key in enumerate(worker_keys):
+        for key in worker_keys:
             stub = self._stubs.get(key)
             if stub is None:
                 continue
-            req = cluster_pb2.UnloadShardRequest(model_id=mid, shard_id=str(i))
+            # При выгрузке модели нужно удалять ВСЕ шарды данного model_id на воркерах.
+            # Иначе для streaming_chunks (где shard_id имеет вид "start-end") можно
+            # случайно оставить старые шарды, что приводит к крашам воркера при повторном старте.
+            req = cluster_pb2.UnloadShardRequest(model_id=mid, shard_id="")
             try:
                 resp = stub.UnloadShard(req, timeout=30.0)
                 if not resp.ok:
