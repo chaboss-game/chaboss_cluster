@@ -178,6 +178,15 @@ def _try_build_qwen3_5_moe_layers_module(model_id: str, state_dict: dict) -> nn.
     """
     if not any(k.startswith("model.language_model.layers.") for k in state_dict):
         return None
+    # Жёсткий guard для GPTQ: такие ключи не совместимы с обычным DecoderLayer.
+    # Делаем проверку по ключам до любых тяжёлых операций с конфигом/модулем.
+    gptq_markers = ("qweight", "qzeros", "scales", "g_idx")
+    if any(any(m in k for m in gptq_markers) for k in state_dict.keys()):
+        logger.warning(
+            "Qwen3.5 MoE + GPTQ: обнаружены GPTQ-ключи (qweight/qzeros/scales/g_idx), "
+            "сборка nn.Module на воркере пропущена."
+        )
+        return None
     try:
         from transformers import AutoConfig
         from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -626,8 +635,22 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
 
                 num_keys = len(state_dict)
                 if state_dict and spec.model_id:
-                    logger.info("InitShard[%s]: trying build layers module for model_id=%s", shard_id, spec.model_id)
-                    module = _try_build_layers_module(spec.model_id, state_dict)
+                    # Доп. страховка для GPTQ: даже если общий builder решит иначе,
+                    # здесь явно запрещаем сборку обычного nn.Module для GPTQ-шардов.
+                    gptq_markers = ("qweight", "qzeros", "scales", "g_idx")
+                    has_gptq_keys = any(
+                        any(m in k for m in gptq_markers)
+                        for k in state_dict.keys()
+                    )
+                    if has_gptq_keys:
+                        logger.warning(
+                            "InitShard[%s]: GPTQ keys detected -> skip nn.Module build, keep raw shard weights",
+                            shard_id,
+                        )
+                        module = None
+                    else:
+                        logger.info("InitShard[%s]: trying build layers module for model_id=%s", shard_id, spec.model_id)
+                        module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
                         logger.info("InitShard[%s]: layers module built type=%s", shard_id, type(module).__name__)
                         self._shard_modules[shard_id] = module

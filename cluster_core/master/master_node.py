@@ -42,6 +42,30 @@ WORKER_CHANNEL_OPTIONS = [
 ]
 
 
+def _is_likely_gptq_model(hf_model_id: str) -> bool:
+    """
+    Best-effort детектор GPTQ.
+    1) Быстрый эвристический чек по имени модели.
+    2) Если доступен transformers, проверка quantization_config.quant_method == gptq.
+    """
+    mid = (hf_model_id or "").strip().lower()
+    if "gptq" in mid:
+        return True
+    try:
+        from transformers import AutoConfig  # type: ignore
+        cfg = AutoConfig.from_pretrained(hf_model_id, trust_remote_code=True)
+        qc = getattr(cfg, "quantization_config", None)
+        if qc is None:
+            return False
+        if isinstance(qc, dict):
+            qm = str(qc.get("quant_method", "")).lower()
+            return qm == "gptq"
+        qm = str(getattr(qc, "quant_method", "")).lower()
+        return qm == "gptq"
+    except Exception:
+        return False
+
+
 def _parse_worker_id(key: str) -> WorkerId:
     host, port_str = key.rsplit(":", 1)
     return WorkerId(host=host, port=int(port_str))
@@ -618,6 +642,15 @@ class MasterNode:
             mode = getattr(self._cfg, "model_load_mode", "fit_in_cluster") or "fit_in_cluster"
             shard_keys_list: List[List[str]] | None = None
             shard_id_list: List[str] = []
+            if mode == "fit_in_cluster" and _is_likely_gptq_model(hf_model_id):
+                msg = (
+                    "Обнаружена GPTQ-модель в режиме fit_in_cluster. "
+                    "Для GPTQ используйте режим 'streaming_chunks' (модель по частям), "
+                    "иначе возможен краш воркера при InitShard."
+                )
+                logger.error("load_model_with_progress[%s]: %s model=%s", load_run_id, msg, hf_model_id)
+                progress_queue.put(make_event(None, {}, done=True, ok=False, error=msg))
+                return
             if mode == "streaming_chunks":
                 # Для streaming_chunks мастер скачивает только ради прогресса/плана; веса целиком в RAM не грузим.
                 ranges = prepare_layer_ranges(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
