@@ -1108,6 +1108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_active_channel_id: str = ""
         self._chat_send_in_progress = False
         self._chat_receivers_refresh_pending = False
+        self._chat_channels_refresh_pending = False
 
         self._chat_poll_timer = QtCore.QTimer(self)
         self._chat_poll_timer.setInterval(2000)
@@ -1141,6 +1142,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chat_channels_combo.addItem("general", userData="general")
             self._chat_active_channel_id = "general"
             self._chat_last_seq = 0
+            if getattr(self, "_chat_channels_refresh_pending", False):
+                self._chat_channels_refresh_pending = False
+                self.append_log("Чат: каналы обновлены (всего: 1).")
             return
 
         current = self._chat_channels_combo.currentData() if hasattr(self, "_chat_channels_combo") else None
@@ -1162,6 +1166,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chat_channels_combo.setCurrentIndex(idx)
         else:
             self._chat_active_channel_id = "general"
+
+        if getattr(self, "_chat_channels_refresh_pending", False):
+            self._chat_channels_refresh_pending = False
+            self.append_log("Чат: каналы обновлены (всего: %d)." % max(1, len(channels)))
 
     def _chat_name_to_id(self, name: str) -> str:
         base = (name or "").strip().lower()
@@ -1434,6 +1442,28 @@ class MainWindow(QtWidgets.QMainWindow):
             "Чат: запрошено обновление получателей (режим мастер, опрос ListWorkers)…"
         )
         threading.Thread(target=self._poller.poll, daemon=True).start()
+
+    def _chat_refresh_channels_and_receivers(self) -> None:
+        """
+        Обновить сразу список каналов (подгрузка с мастера) и получателей онлайн.
+        Кнопка привязана к этому методу.
+        """
+        btn = getattr(self, "_chat_refresh_receivers_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+
+        self._chat_channels_refresh_pending = True
+        self.append_log("Чат: запрошено обновление каналов и получателей…")
+
+        addr = getattr(self, "_addr", "") or ""
+        if not addr:
+            self._chat_channels_refresh_pending = False
+            self.append_log("Чат: обновление каналов отменено — мастер не задан.")
+        else:
+            self._chat_load_channels()
+
+        # Обновляем получателей (этот метод также управляет повторным включением кнопки)
+        self._chat_refresh_receivers()
 
     def _chat_add_attachments(self, paths: List[str]) -> None:
         if not paths:

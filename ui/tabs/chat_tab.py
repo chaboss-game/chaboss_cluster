@@ -50,7 +50,7 @@ class ChatTabWidget:
         owner._chat_refresh_receivers_btn.setIcon(
             owner.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload)
         )
-        owner._chat_refresh_receivers_btn.clicked.connect(owner._chat_refresh_receivers)
+        owner._chat_refresh_receivers_btn.clicked.connect(owner._chat_refresh_channels_and_receivers)
         recv_row.addWidget(owner._chat_refresh_receivers_btn, 0)
         chat_channels_layout.addLayout(recv_row)
         owner._chat_workers_checklist = QtWidgets.QListWidget()
