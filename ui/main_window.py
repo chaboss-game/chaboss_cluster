@@ -149,6 +149,7 @@ class MainWindow(QtWidgets.QMainWindow):
     chat_send_finished = QtCore.pyqtSignal(bool, str)
     chat_channels_mutation_finished = QtCore.pyqtSignal(bool, str)
     chat_workers_for_checklist_received = QtCore.pyqtSignal(dict)  # dict[str, dict]
+    chat_receivers_refresh_failed = QtCore.pyqtSignal(str)  # ошибка опроса мастера для чеклиста (режим воркер)
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
@@ -170,6 +171,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chat_send_finished.connect(self._chat_on_send_finished)
         self.chat_channels_mutation_finished.connect(self._chat_on_channels_mutation_finished)
         self.chat_workers_for_checklist_received.connect(self._on_chat_workers_for_checklist_received)
+        self.chat_receivers_refresh_failed.connect(self._on_chat_receivers_refresh_failed)
 
         settings = load_settings()
         self._addr = (
@@ -516,7 +518,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         return
                 self.worker_master_status.emit("", "не найден")
             except Exception as e:
-                self.worker_master_status.emit("", "ошибка: %s" % (e if len(str(e)) < 60 else str(e)[:57] + "..."))
+                err_short = e if len(str(e)) < 60 else str(e)[:57] + "..."
+                self.worker_master_status.emit("", "ошибка: %s" % err_short)
+                self.chat_receivers_refresh_failed.emit(str(e))
 
         threading.Thread(target=do_poll, daemon=True).start()
 
@@ -536,9 +540,19 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             # чеклист может ещё не быть создан (на ранней стадии init)
             pass
+        self._chat_on_receivers_poll_finished(workers)
         btn = getattr(self, "_chat_refresh_receivers_btn", None)
         if btn is not None:
             btn.setEnabled(True)
+
+    def _on_chat_receivers_refresh_failed(self, err: str) -> None:
+        """Опрос ListWorkers для чеклиста не удался (режим воркер)."""
+        btn = getattr(self, "_chat_refresh_receivers_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
+        if getattr(self, "_chat_receivers_refresh_pending", False):
+            self._chat_receivers_refresh_pending = False
+            self.append_log("Чат: обновление получателей не выполнено: %s" % (err or "неизвестная ошибка"))
 
     def _update_process_state(self) -> None:
         """Обновить вид кластера и блокировки: мастер и воркер взаимоисключающие."""
@@ -742,8 +756,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         msg = f"{r.worker}: ошибка: {r.error}"
                         err_lower = (r.error or "").lower()
+                        out_lower = (r.output or "").lower()
                         if "method not found" in err_lower or "unimplemented" in err_lower:
                             msg += "\n  → На этой машине воркер запущен со старой версией. Остановите воркер, сделайте git pull и перезапустите воркер вручную."
+                        elif (
+                            "unmerged" in err_lower
+                            or "unmerged" in out_lower
+                            or "conflict" in err_lower
+                            or "conflict" in out_lower
+                        ):
+                            msg += (
+                                "\n  → Локально на этом воркере незавершённое слияние/rebase. "
+                                "Исправьте репозиторий вручную (см. вывод git выше), затем повторите Remote update."
+                            )
                     if r.output:
                         out = r.output.strip().replace("\r\n", "\n")
                         if len(out) > 400:
@@ -1024,6 +1049,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_workers_dict = dict(workers)
         if hasattr(self, "_chat_workers_checklist"):
             self._chat_sync_workers_checklist(workers)
+        self._chat_on_receivers_poll_finished(workers)
         self._update_resources_label(workers)
 
         # Блокировка работы с моделью при несоответствии токенов
@@ -1039,6 +1065,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_poller_error(self, msg: str) -> None:
         self.append_log("Ошибка подключения к мастеру: " + msg)
+        if getattr(self, "_chat_receivers_refresh_pending", False):
+            self._chat_receivers_refresh_pending = False
+            self.append_log("Чат: обновление получателей не выполнено (нет связи с мастером).")
         short = self._chat_format_error(msg)
         self.statusBar().showMessage(short)
         self._table_model.update_workers({})
@@ -1078,6 +1107,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_last_seq = 0
         self._chat_active_channel_id: str = ""
         self._chat_send_in_progress = False
+        self._chat_receivers_refresh_pending = False
 
         self._chat_poll_timer = QtCore.QTimer(self)
         self._chat_poll_timer.setInterval(2000)
@@ -1351,6 +1381,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._chat_workers_checklist.addItem(item)
         self._chat_workers_checklist.blockSignals(False)
 
+    def _chat_on_receivers_poll_finished(self, workers: Dict[str, dict]) -> None:
+        """Один раз логирует результат после ручного обновления чеклиста получателей."""
+        if not getattr(self, "_chat_receivers_refresh_pending", False):
+            return
+        self._chat_receivers_refresh_pending = False
+        online_n = sum(1 for w in workers.values() if (w.get("status") or "").upper() == "ONLINE")
+        self.append_log(
+            "Чат: получатели обновлены (в реестре мастера: %d, ONLINE: %d)."
+            % (len(workers), online_n)
+        )
+
     def _chat_refresh_receivers(self) -> None:
         """
         Принудительно обновить список получателей (чеклист ONLINE).
@@ -1364,9 +1405,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
         worker_process = getattr(self, "_worker_process", None)
         if worker_process is not None and worker_process.poll() is None:
+            port = getattr(self, "_worker_display_port", None)
+            addr = getattr(self, "_addr", DEFAULT_MASTER_ADDR)
+            if not port:
+                self.append_log(
+                    "Чат: обновление получателей отменено — не задан порт воркера (см. config/worker.yaml)."
+                )
+                if btn is not None:
+                    btn.setEnabled(True)
+                return
+            ok_addr, addr_err = _validate_host_port(addr)
+            if not ok_addr:
+                self.append_log(
+                    "Чат: обновление получателей отменено — некорректный адрес мастера: %s" % addr_err
+                )
+                if btn is not None:
+                    btn.setEnabled(True)
+                return
+            self._chat_receivers_refresh_pending = True
+            self.append_log(
+                "Чат: запрошено обновление получателей (режим воркер, опрос мастера ListWorkers)…"
+            )
             self._poll_worker_visibility()
             return
 
+        self._chat_receivers_refresh_pending = True
+        self.append_log(
+            "Чат: запрошено обновление получателей (режим мастер, опрос ListWorkers)…"
+        )
         threading.Thread(target=self._poller.poll, daemon=True).start()
 
     def _chat_add_attachments(self, paths: List[str]) -> None:

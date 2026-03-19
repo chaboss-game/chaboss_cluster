@@ -745,9 +745,29 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             output += ("\n" if output else "") + out.stderr
 
         if out.returncode != 0:
+            err = f"git pull failed (code={out.returncode})"
+            low = output.lower()
+            if any(
+                s in low
+                for s in (
+                    "unmerged files",
+                    "unresolved conflict",
+                    "merge conflict",
+                    "you need to resolve",
+                    "fix them up in the work tree",
+                    "rebase conflict",
+                )
+            ):
+                err += (
+                    " — конфликт слияния/rebase в репозитории на этой машине. "
+                    "Зайдите в каталог проекта на воркере, выполните `git status`, "
+                    "разрешите конфликты, затем `git add` нужные файлы и "
+                    "`git commit` (или отмените операцию: `git merge --abort` / `git rebase --abort`), "
+                    "после чего снова `git pull`. Затем перезапустите воркер."
+                )
             return cluster_pb2.RemoteUpdateResponse(
                 ok=False,
-                error=f"git pull failed (code={out.returncode})",
+                error=err,
                 output=output,
             )
 
