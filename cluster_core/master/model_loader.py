@@ -116,9 +116,30 @@ def _split_state_dict_by_layers(
     indices = sorted(by_layer.keys())
     n_shards = min(n_workers, len(indices))
     shards: List[dict] = [{} for _ in range(n_shards)]
-    for i, layer_idx in enumerate(indices):
-        shard_idx = i % n_shards
+    # Балансируем шардирование не по количеству ключей, а по приблизительному размеру тензоров.
+    # Для больших MoE/GPTQ-моделей равное число ключей может давать сильно разный объём памяти.
+    shard_sizes: List[int] = [0 for _ in range(n_shards)]
+    layer_sizes: dict[int, int] = {}
+    for layer_idx in indices:
+        size_b = 0
+        for v in by_layer[layer_idx].values():
+            try:
+                size_b += int(v.numel()) * int(v.element_size())
+            except Exception:
+                size_b += 1
+        layer_sizes[layer_idx] = max(1, size_b)
+
+    # First-fit decreasing: сначала размещаем самые "тяжёлые" слои.
+    for layer_idx in sorted(indices, key=lambda x: layer_sizes.get(x, 1), reverse=True):
+        shard_idx = min(range(n_shards), key=lambda i: shard_sizes[i])
         shards[shard_idx].update(by_layer[layer_idx])
+        shard_sizes[shard_idx] += layer_sizes.get(layer_idx, 1)
+    logger.info(
+        "Layer-aware shard balancing: workers=%d layers=%d approx_sizes_mb=%s",
+        n_shards,
+        len(indices),
+        [round(s / (1024 * 1024), 1) for s in shard_sizes],
+    )
     return shards
 
 

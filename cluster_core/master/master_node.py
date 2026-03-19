@@ -66,6 +66,19 @@ def _is_likely_gptq_model(hf_model_id: str) -> bool:
         return False
 
 
+def _worker_budget_mb_from_descriptor(wd: WorkerDescriptor | None) -> int:
+    if wd is None:
+        return 0
+    ram = int(getattr(wd.resources, "ram_available_mb", 0) or 0)
+    vram = 0
+    for g in getattr(wd.resources, "gpus", []) or []:
+        try:
+            vram += int(getattr(g, "total_vram_mb", 0) or 0)
+        except Exception:
+            pass
+    return ram + vram
+
+
 def _parse_worker_id(key: str) -> WorkerId:
     host, port_str = key.rsplit(":", 1)
     return WorkerId(host=host, port=int(port_str))
@@ -506,6 +519,13 @@ class MasterNode:
             worker_keys = list(self._stubs.keys())
         if not worker_keys:
             return False, "Нет подключённых воркеров"
+        # Раскладываем шарды сначала на более ёмкие ноды (RAM+VRAM), чтобы снизить риск OOM на слабых узлах.
+        reg_snapshot = self._registry.all()
+        worker_keys = sorted(
+            worker_keys,
+            key=lambda k: _worker_budget_mb_from_descriptor(reg_snapshot.get(k)),
+            reverse=True,
+        )
 
         # Запрет работы с моделью при несоответствии токенов
         bad = [k for k, wd in self._registry.all().items() if (wd.token_status or "") == "MISMATCH"]
@@ -623,7 +643,23 @@ class MasterNode:
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="Нет подключённых воркеров"))
                 logger.warning("load_model_with_progress[%s]: no connected workers", load_run_id)
                 return
+            reg_snapshot = self._registry.all()
+            worker_keys = sorted(
+                worker_keys,
+                key=lambda k: _worker_budget_mb_from_descriptor(reg_snapshot.get(k)),
+                reverse=True,
+            )
+            with self._lock:
+                stubs_snapshot = {k: stubs_snapshot[k] for k in worker_keys if k in stubs_snapshot}
             logger.info("load_model_with_progress[%s]: connected workers=%d", load_run_id, len(worker_keys))
+            logger.info(
+                "load_model_with_progress[%s]: worker order by budget=%s",
+                load_run_id,
+                [
+                    f"{k}({_worker_budget_mb_from_descriptor(reg_snapshot.get(k))}MB)"
+                    for k in worker_keys
+                ],
+            )
             bad = [k for k, wd in self._registry.all().items() if (wd.token_status or "") == "MISMATCH"]
             if bad:
                 progress_queue.put(make_event(None, {}, done=True, ok=False, error="Несоответствие auth_token у воркеров: " + ", ".join(sorted(bad))))
@@ -643,14 +679,12 @@ class MasterNode:
             shard_keys_list: List[List[str]] | None = None
             shard_id_list: List[str] = []
             if mode == "fit_in_cluster" and _is_likely_gptq_model(hf_model_id):
-                msg = (
-                    "Обнаружена GPTQ-модель в режиме fit_in_cluster. "
-                    "Для GPTQ используйте режим 'streaming_chunks' (модель по частям), "
-                    "иначе возможен краш воркера при InitShard."
+                logger.warning(
+                    "load_model_with_progress[%s]: GPTQ model in fit_in_cluster -> auto fallback to streaming_chunks (%s)",
+                    load_run_id,
+                    hf_model_id,
                 )
-                logger.error("load_model_with_progress[%s]: %s model=%s", load_run_id, msg, hf_model_id)
-                progress_queue.put(make_event(None, {}, done=True, ok=False, error=msg))
-                return
+                mode = "streaming_chunks"
             if mode == "streaming_chunks":
                 # Для streaming_chunks мастер скачивает только ради прогресса/плана; веса целиком в RAM не грузим.
                 ranges = prepare_layer_ranges(hf_model_id, len(worker_keys), progress_callback=on_master_progress)

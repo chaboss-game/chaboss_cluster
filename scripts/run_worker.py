@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
 import sys
 from concurrent import futures
@@ -45,6 +46,10 @@ def main() -> None:
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter(fmt))
         root.addHandler(fh)
+        # Отдельный лог на случай segfault/abort/native crash:
+        # помогает понять, в каком потоке и на каком Python-stack упал воркер.
+        crash_log = (log_dir / "worker_faulthandler.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=crash_log, all_threads=True)
     except Exception:  # права, путь, блокировка файла — воркер не должен падать
         pass
     logger = logging.getLogger("worker")
