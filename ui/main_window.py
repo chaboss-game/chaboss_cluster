@@ -1252,6 +1252,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _chat_sync_workers_checklist(self, workers: Dict[str, dict]) -> None:
         if not hasattr(self, "_chat_workers_checklist"):
             return
+        original_worker_keys = set(workers.keys())
         self_host = getattr(self, "_worker_display_host", None)
         self_port = getattr(self, "_worker_display_port", None)
         self_key = None
@@ -1285,7 +1286,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_workers_checklist.blockSignals(True)
         self._chat_workers_checklist.clear()
         for key, w in sorted(workers.items()):
-            if self_key and str(key).strip() == self_key:
+            # Пропускаем "себя" только если этот endpoint реально пришёл от мастера.
+            # Иначе можем случайно пропустить мастер-опцию, которую мы добавляем вручную ниже.
+            if self_key and str(key).strip() == self_key and str(key).strip() in original_worker_keys:
                 continue
             if (w.get("status") or "").upper() != "ONLINE":
                 continue
