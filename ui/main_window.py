@@ -148,6 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
     chat_clipboard_set_image = QtCore.pyqtSignal(object)
     chat_send_finished = QtCore.pyqtSignal(bool, str)
     chat_channels_mutation_finished = QtCore.pyqtSignal(bool, str)
+    chat_workers_for_checklist_received = QtCore.pyqtSignal(dict)  # dict[str, dict]
 
     def __init__(self, master_addr: str | None = None) -> None:
         super().__init__()
@@ -168,6 +169,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chat_clipboard_set_image.connect(self._chat_set_clipboard_image)
         self.chat_send_finished.connect(self._chat_on_send_finished)
         self.chat_channels_mutation_finished.connect(self._chat_on_channels_mutation_finished)
+        self.chat_workers_for_checklist_received.connect(self._on_chat_workers_for_checklist_received)
 
         settings = load_settings()
         self._addr = (
@@ -502,6 +504,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 response = stub.ListWorkers(cluster_pb2.Empty(), timeout=5.0)
                 channel.close()
                 workers = _worker_list_to_dict(response)
+                # В режиме "Воркер" обычный опрос мастера (MasterPoller) выключен,
+                # а чеклист получателей в чате обновляется только через _chat_sync_workers_checklist.
+                # Поэтому обновляем чеклист напрямую, но через сигнал (в UI-потоке).
+                self.chat_workers_for_checklist_received.emit(workers)
                 suffix = ":%s" % port
                 for key, w in workers.items():
                     if key.endswith(suffix):
@@ -522,6 +528,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker_master_status_text = "В реестре мастера: %s" % status
         if getattr(self, "_worker_process", None) is not None and self._worker_process.poll() is None:
             self._refresh_worker_status_label()
+
+    def _on_chat_workers_for_checklist_received(self, workers: dict) -> None:
+        """Обновить список получателей в чате (галочки ONLINE) в GUI-потоке."""
+        try:
+            self._chat_sync_workers_checklist(workers)
+        except Exception:
+            # чеклист может ещё не быть создан (на ранней стадии init)
+            pass
 
     def _update_process_state(self) -> None:
         """Обновить вид кластера и блокировки: мастер и воркер взаимоисключающие."""
@@ -594,10 +608,12 @@ class MainWindow(QtWidgets.QMainWindow):
         config_path = self._worker_config_edit.text().strip() or "config/worker.yaml"
         path_resolved = (project_root / config_path).resolve()
         self._worker_display_port = None
+        self._worker_display_host = None
         try:
             if path_resolved.exists():
                 with open(path_resolved, "r", encoding="utf-8") as f:
                     cfg = yaml.safe_load(f) or {}
+                self._worker_display_host = str(cfg.get("listen_host") or "").strip() or None
                 self._worker_display_port = int(cfg.get("listen_port", 0)) or None
         except Exception:
             pass
@@ -1236,6 +1252,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _chat_sync_workers_checklist(self, workers: Dict[str, dict]) -> None:
         if not hasattr(self, "_chat_workers_checklist"):
             return
+        self_host = getattr(self, "_worker_display_host", None)
+        self_port = getattr(self, "_worker_display_port", None)
+        self_key = None
+        if self_host and self_port:
+            self_key = f"{self_host}:{self_port}"
+
+        # В режиме "Воркер" хотим:
+        # 1) не показывать получателем сам себя;
+        # 2) показать мастер как опцию (сообщение всё равно сохраняется в мастере).
+        worker_mode = getattr(self, "_worker_process", None) is not None and self._worker_process.poll() is None
+        master_key = getattr(self, "_addr", "") or ""
+        if worker_mode and master_key and master_key not in workers:
+            workers = dict(workers)
+            workers[master_key] = {
+                "status": "ONLINE",
+                "token_status": "",
+                "os": "",
+                "cpu_cores": 0,
+                "ram_total_mb": 0,
+                "ram_available_mb": 0,
+                "gpus": [],
+            }
         # Сохраняем выбранные ключи, чтобы не сбрасывать галочки при обновлении списка
         checked_keys: set = set()
         for i in range(self._chat_workers_checklist.count()):
@@ -1247,6 +1285,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_workers_checklist.blockSignals(True)
         self._chat_workers_checklist.clear()
         for key, w in sorted(workers.items()):
+            if self_key and str(key).strip() == self_key:
+                continue
             if (w.get("status") or "").upper() != "ONLINE":
                 continue
             item = QtWidgets.QListWidgetItem(key)
