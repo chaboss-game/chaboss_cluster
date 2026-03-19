@@ -399,6 +399,12 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             hashlib.sha256(auth_token.encode("utf-8")).hexdigest()[:12] if auth_token else ""
         )
         self._resources = _detect_resources()
+        self._compute_device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(
+            "Worker compute device selected: %s (cuda_available=%s)",
+            self._compute_device,
+            torch.cuda.is_available(),
+        )
         self._shards: Dict[str, Dict[str, Any]] = {}  # shard_id -> state_dict chunk
         self._shard_modules: Dict[str, nn.Module] = {}  # shard_id -> nn.Module (BERT layers и т.д.)
         self._stream_plans: Dict[str, Dict[str, Any]] = {}  # module_key -> {path, model_id, start, end}
@@ -508,6 +514,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                     logger.info("Сборка модуля слоёв для model_id=%s...", spec.model_id)
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
+                        if self._compute_device == "cuda":
+                            module = module.to("cuda")
                         self._shard_modules[shard_id] = module
                         self._shards[shard_id] = {}
                         del state_dict
@@ -539,6 +547,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 if state_dict and spec.model_id:
                     module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
+                        if self._compute_device == "cuda":
+                            module = module.to("cuda")
                         self._shard_modules[shard_id] = module
                         self._shards[shard_id] = {}
                         del state_dict
@@ -652,6 +662,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                         logger.info("InitShard[%s]: trying build layers module for model_id=%s", shard_id, spec.model_id)
                         module = _try_build_layers_module(spec.model_id, state_dict)
                     if module is not None:
+                        if self._compute_device == "cuda":
+                            module = module.to("cuda")
                         logger.info("InitShard[%s]: layers module built type=%s", shard_id, type(module).__name__)
                         self._shard_modules[shard_id] = module
                         # Не держим state_dict в _shards — модуль уже содержит веса.
@@ -718,6 +730,11 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 }
                 elapsed = time.perf_counter() - t0
                 logger.info("InitShard streaming: план сохранён, слои [%d..%d), время=%.2f с", start_i, end_i, elapsed)
+                logger.info(
+                    "InitShard streaming: на этапе init сохраняется только план слоёв; "
+                    "фактическая подгрузка/вычисление слоёв выполняется в RunStage (device=%s).",
+                    self._compute_device,
+                )
             else:
                 return cluster_pb2.InitShardResponse(ok=False, error="Не задан источник весов")
         except Exception as e:  # noqa: BLE001
@@ -1016,7 +1033,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 )
                 continue
             try:
-                tensor = payload_to_tensor(req.tensor, device="cpu")
+                tensor = payload_to_tensor(req.tensor, device=self._compute_device)
                 module_key = f"{req.model_id}:{req.shard_id}" if (req.model_id and req.shard_id) else None
                 if module_key and module_key in self._shard_modules:
                     mod = self._shard_modules[module_key]
@@ -1122,7 +1139,7 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
             return layer
 
         with torch.no_grad():
-            cur = tensor
+            cur = tensor.to(self._compute_device)
             if cur.dim() == 2:
                 cur = cur.unsqueeze(0)
             for idx in range(start, end):
@@ -1130,11 +1147,15 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
                 if not layer_sd:
                     raise KeyError(f"Не найдены ключи слоя {layer_key_prefix(idx)}* в safetensors")
                 layer = build_layer(idx, layer_sd)
+                if self._compute_device == "cuda":
+                    layer = layer.to("cuda")
                 out = layer(cur)
                 if isinstance(out, tuple):
                     out = out[0]
                 cur = out
                 del layer
                 del layer_sd
+                if self._compute_device == "cuda":
+                    torch.cuda.empty_cache()
             return cur
 

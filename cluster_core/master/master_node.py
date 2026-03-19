@@ -685,6 +685,7 @@ class MasterNode:
                     hf_model_id,
                 )
                 mode = "streaming_chunks"
+                progress_queue.put(make_event(make_master_progress("auto_fallback_streaming", 100), {}))
             if mode == "streaming_chunks":
                 # Для streaming_chunks мастер скачивает только ради прогресса/плана; веса целиком в RAM не грузим.
                 ranges = prepare_layer_ranges(hf_model_id, len(worker_keys), progress_callback=on_master_progress)
