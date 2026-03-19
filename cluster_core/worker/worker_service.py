@@ -714,13 +714,8 @@ class WorkerService(cluster_pb2_grpc.WorkerServiceServicer):
         git_remote = (request.git_remote or "origin").strip() or "origin"
         git_branch = (request.git_branch or "").strip()
 
-        # Убираем файлы/каталоги, из-за которых git pull выдаёт "untracked working tree files would be overwritten by merge"
-        pid_file = project_root / ".chaboss_gui.pid"
-        if pid_file.exists():
-            try:
-                pid_file.unlink()
-            except OSError:
-                pass
+        # Убираем каталоги, из-за которых git pull может падать на untracked-конфликтах.
+        # PID-файл GUI НЕ трогаем: он нужен для корректного авто-перезапуска GUI после обновления.
         for pycache in project_root.rglob("__pycache__"):
             if pycache.is_dir():
                 try:

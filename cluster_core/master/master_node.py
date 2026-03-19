@@ -108,6 +108,10 @@ class MasterNode:
         project_root = Path(__file__).resolve().parents[2]
         shared_root = project_root / "cluster_shared"
         self._chat_storage = ChatStorage(shared_root, cache_messages=2000)
+        # Защита от повторной пересылки одного сообщения (идемпотентность при ретраях)
+        self._chat_forwarded_ids: Dict[str, float] = {}  # message_id -> time
+        self._chat_forwarded_max = 500
+        self._chat_forwarded_ttl_s = 120
 
     def start_background(self) -> None:
         """Старт: первичное подключение к воркерам и поток HealthStream для каждого из конфига."""
@@ -674,11 +678,26 @@ class MasterNode:
     ) -> None:
         """
         Best-effort: переслать сообщение и вложения выбранным воркерам.
-        Не блокируем UI: запускаем в фоне.
+        Идемпотентность: один message_id пересылаем только один раз (защита от дублей при ретраях).
         """
         target_keys = list(header.target_worker_keys)
         if not target_keys:
             return
+        mid = (header.message_id or "").strip()
+        if not mid:
+            return
+        now = time.time()
+        with self._lock:
+            if mid in self._chat_forwarded_ids:
+                return
+            # Очистка старых записей
+            expired = [k for k, t in self._chat_forwarded_ids.items() if now - t > self._chat_forwarded_ttl_s]
+            for k in expired:
+                del self._chat_forwarded_ids[k]
+            while len(self._chat_forwarded_ids) >= self._chat_forwarded_max:
+                oldest = min(self._chat_forwarded_ids.items(), key=lambda x: x[1])
+                del self._chat_forwarded_ids[oldest[0]]
+            self._chat_forwarded_ids[mid] = now
 
         def run() -> None:
             for worker_key in target_keys:

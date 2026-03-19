@@ -382,6 +382,13 @@ class MainWindow(QtWidgets.QMainWindow):
         chat_channels_btns.addWidget(rename_channel_btn)
         chat_channels_btns.addWidget(del_channel_btn)
         chat_channels_layout.addLayout(chat_channels_btns)
+        # Получатели — под каналами, чтобы список был хорошо виден
+        chat_channels_layout.addWidget(QtWidgets.QLabel("Получатели (онлайн):"))
+        self._chat_workers_checklist = QtWidgets.QListWidget()
+        self._chat_workers_checklist.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self._chat_workers_checklist.setMinimumHeight(80)
+        self._chat_workers_checklist.setMaximumHeight(180)
+        chat_channels_layout.addWidget(self._chat_workers_checklist)
         chat_channels_layout.addStretch()
         chat_channels_panel.setLayout(chat_channels_layout)
 
@@ -418,48 +425,56 @@ class MainWindow(QtWidgets.QMainWindow):
         # (получатели/кнопка/статус) не уезжала за пределы окна.
         chat_tab_layout.addWidget(chat_split, 2)
 
-        # Панель отправки (получатели/текст/вложения)
+        # Панель отправки: только текст, вложения и кнопка (получатели — под каналами)
         send_grp = QtWidgets.QGroupBox("Отправка")
         send_layout = QtWidgets.QVBoxLayout()
-
-        send_layout.addWidget(QtWidgets.QLabel("Получатели (выбранные воркеры онлайн):"))
-        self._chat_workers_checklist = QtWidgets.QListWidget()
-        self._chat_workers_checklist.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        self._chat_workers_checklist.setMaximumHeight(120)
-        send_layout.addWidget(self._chat_workers_checklist)
+        send_layout.setSpacing(8)
 
         send_layout.addWidget(QtWidgets.QLabel("Текст:"))
         self._chat_text_edit = QtWidgets.QTextEdit()
         self._chat_text_edit.setPlaceholderText("Введите сообщение...")
-        self._chat_text_edit.setFixedHeight(60)
+        self._chat_text_edit.setMinimumHeight(72)
+        self._chat_text_edit.setMaximumHeight(110)
         send_layout.addWidget(self._chat_text_edit)
 
+        # Строка «Добавить файлы» + drop — отдельно от поля текста
         attach_row = QtWidgets.QHBoxLayout()
         self._chat_add_files_btn = QtWidgets.QPushButton("Добавить файлы")
         self._chat_add_files_btn.clicked.connect(self._chat_pick_files)
+        self._chat_add_files_btn.setMinimumHeight(30)
         attach_row.addWidget(self._chat_add_files_btn)
-
         self._chat_drop_area = QtWidgets.QFrame()
         self._chat_drop_area.setFrameShape(QtWidgets.QFrame.Shape.Box)
         self._chat_drop_area.setAcceptDrops(True)
         self._chat_drop_area.setToolTip("Перетащите файлы сюда (до 20MB каждый, до 5 штук)")
+        self._chat_drop_area.setMinimumHeight(30)
         drop_layout = QtWidgets.QVBoxLayout()
+        drop_layout.setContentsMargins(8, 2, 8, 2)
         self._chat_drop_label = QtWidgets.QLabel("Drag & Drop файлов/фото сюда")
         drop_layout.addWidget(self._chat_drop_label)
         self._chat_drop_area.setLayout(drop_layout)
-        # Внутри PyQt6 обработчики drag&drop проще навесить через subclass, но для MVP хватит eventFilter.
         self._chat_drop_area.installEventFilter(self)
         attach_row.addWidget(self._chat_drop_area, 1)
         send_layout.addLayout(attach_row)
 
+        self._chat_selected_files_label = QtWidgets.QLabel("Выбранные файлы:")
+        send_layout.addWidget(self._chat_selected_files_label)
         self._chat_selected_files_list = QtWidgets.QListWidget()
         self._chat_selected_files_list.setMaximumHeight(90)
+        self._chat_selected_files_list.setPlaceholderText("Файлы не выбраны")
+        self._chat_selected_files_label.setVisible(False)
+        self._chat_selected_files_list.setVisible(False)
         send_layout.addWidget(self._chat_selected_files_list)
 
+        # Кнопка «Отправить» — обычный размер, справа внизу
+        send_btn_row = QtWidgets.QHBoxLayout()
+        send_btn_row.addStretch()
         self._chat_send_btn = QtWidgets.QPushButton("Отправить")
+        self._chat_send_btn.setMinimumWidth(120)
         self._chat_send_btn.clicked.connect(self._chat_send_message)
+        send_btn_row.addWidget(self._chat_send_btn)
+        send_layout.addLayout(send_btn_row)
         self._chat_send_status = QtWidgets.QLabel("")
-        send_layout.addWidget(self._chat_send_btn)
         send_layout.addWidget(self._chat_send_status)
         send_grp.setLayout(send_layout)
         send_grp.setMinimumHeight(220)
@@ -1339,6 +1354,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_attachment_cache: Dict[str, bytes] = {}
         self._chat_last_seq = 0
         self._chat_active_channel_id: str = ""
+        self._chat_send_in_progress = False
 
         self._chat_poll_timer = QtCore.QTimer(self)
         self._chat_poll_timer.setInterval(2000)
@@ -1513,15 +1529,24 @@ class MainWindow(QtWidgets.QMainWindow):
     def _chat_sync_workers_checklist(self, workers: Dict[str, dict]) -> None:
         if not hasattr(self, "_chat_workers_checklist"):
             return
+        # Сохраняем выбранные ключи, чтобы не сбрасывать галочки при обновлении списка
+        checked_keys: set = set()
+        for i in range(self._chat_workers_checklist.count()):
+            item = self._chat_workers_checklist.item(i)
+            if item and item.checkState() == QtCore.Qt.CheckState.Checked:
+                k = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if k:
+                    checked_keys.add(str(k))
         self._chat_workers_checklist.blockSignals(True)
         self._chat_workers_checklist.clear()
         for key, w in sorted(workers.items()):
-            # берем только ONLINE для выбора
             if (w.get("status") or "").upper() != "ONLINE":
                 continue
             item = QtWidgets.QListWidgetItem(key)
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked if key in checked_keys else QtCore.Qt.CheckState.Unchecked
+            )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
             self._chat_workers_checklist.addItem(item)
         self._chat_workers_checklist.blockSignals(False)
@@ -1582,6 +1607,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_selected_files_list.clear()
         for att in self._chat_pending_attachments:
             self._chat_selected_files_list.addItem(att.get("filename") or att.get("path") or "file")
+        has_files = len(self._chat_pending_attachments) > 0
+        self._chat_selected_files_label.setVisible(has_files)
+        self._chat_selected_files_list.setVisible(has_files)
 
     def _chat_pick_files(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -1660,8 +1688,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for m in msgs:
             text = (m.get("text") or "").strip()
             sender = m.get("sender") or ""
+            ts_ms = int(m.get("timestamp_ms") or 0)
+            try:
+                dt = datetime.fromtimestamp(ts_ms / 1000.0) if ts_ms else datetime.now()
+                time_str = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                time_str = ""
             preview = (text[:60] + ("..." if len(text) > 60 else "")) if text else "(без текста)"
-            item = QtWidgets.QListWidgetItem(f"{sender}: {preview}")
+            item = QtWidgets.QListWidgetItem(f"[{time_str}] {sender}: {preview}")
             # иконка для первого изображения
             icon_pixmap = None
             for a in m.get("attachments") or []:
@@ -1779,18 +1813,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chat_send_status.setText("Готово")
 
     def _chat_on_send_finished(self, ok: bool, error: str) -> None:
-        # универсальный хук: ок/ошибка для отправки и для копирования.
+        # Вызывается в GUI-потоке по сигналу — все обновления UI только здесь.
+        self._chat_send_in_progress = False
         self._chat_send_btn.setEnabled(True)
         if ok:
+            self._chat_text_edit.setPlainText("")
+            self._chat_pending_attachments = []
+            self._chat_selected_files_list.clear()
+            self._chat_selected_files_label.setVisible(False)
+            self._chat_selected_files_list.setVisible(False)
+            self._chat_send_status.setText("Отправлено")
+            self._chat_poll_history(force=False)
+            self.append_log("Чат: сообщение отправлено")
             if error:
                 self.append_log(error)
         else:
+            self._chat_send_status.setText("")
             if error:
                 self.append_log(error)
-        if not ok and error:
-            QtWidgets.QMessageBox.warning(self, "Чат", error)
+                QtWidgets.QMessageBox.warning(self, "Чат", error)
 
     def _chat_send_message(self) -> None:
+        if getattr(self, "_chat_send_in_progress", False):
+            return
         if not getattr(self, "_chat_pending_attachments", None):
             self._chat_pending_attachments = []
 
@@ -1883,26 +1928,20 @@ class MainWindow(QtWidgets.QMainWindow):
                         b = b2
 
         def do_send() -> None:
+            # Не трогаем UI из потока — только gRPC и emit в GUI-поток.
             try:
                 ch = grpc.insecure_channel(addr)
                 stub = cluster_pb2_grpc.MasterAdminServiceStub(ch)
                 resp = stub.PostChatMessage(gen(), timeout=600.0)
                 ch.close()
                 if resp.ok:
-                    # очистка ввода в GUI потоке
-                    self._chat_text_edit.setPlainText("")
-                    self._chat_pending_attachments = []
-                    self._chat_selected_files_list.clear()
-                    self._chat_send_status.setText("Отправлено")
-                    # обновить чат
-                    self._chat_poll_history(force=False)
                     self.chat_send_finished.emit(True, "")
-                    self.append_log(f"Чат: сообщение {message_id} отправлено")
                 else:
                     self.chat_send_finished.emit(False, resp.error or "Ошибка отправки")
             except Exception as e:  # noqa: BLE001
                 self.chat_send_finished.emit(False, str(e))
 
+        self._chat_send_in_progress = True
         threading.Thread(target=do_send, daemon=True).start()
 
     # end chat
