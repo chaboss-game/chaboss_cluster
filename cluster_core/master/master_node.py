@@ -47,6 +47,14 @@ def _parse_worker_id(key: str) -> WorkerId:
     return WorkerId(host=host, port=int(port_str))
 
 
+def _endpoint_matches(expected_host: str, expected_port: int, actual_host: str, actual_port: int) -> bool:
+    """
+    Строгая валидация endpoint воркера.
+    На текущем этапе считаем валидным только точное совпадение host:port.
+    """
+    return (expected_host or "").strip() == (actual_host or "").strip() and int(expected_port) == int(actual_port)
+
+
 def _descriptor_from_proto(desc: cluster_pb2.WorkerDescriptor) -> WorkerDescriptor:
     gpus = [
         GpuInfo(
@@ -167,6 +175,40 @@ class MasterNode:
             self._registry.upsert(wd)
             return
 
+        # Сырой ответ воркера в лог для отладки (виден в окне «Лог» GUI).
+        logger.info(
+            "GetStatus raw response [target=%s]: id.host=%r id.port=%s status=%s token_fingerprint=%s "
+            "token_status=%s cpu_cores=%s ram_total_mb=%s ram_available_mb=%s os=%s %s",
+            target,
+            getattr(desc.id, "host", None),
+            getattr(desc.id, "port", None),
+            getattr(desc, "status", None),
+            getattr(desc, "token_fingerprint", None) or "",
+            getattr(desc, "token_status", None) or "",
+            getattr(desc.resources, "cpu_cores", None),
+            getattr(desc.resources, "ram_total_mb", None),
+            getattr(desc.resources, "ram_available_mb", None),
+            (getattr(desc.resources, "os_name", None) or "") + " " + (getattr(desc.resources, "os_version", None) or ""),
+            "gpus=%s" % len(getattr(desc.resources, "gpus", [])),
+        )
+
+        if not _endpoint_matches(w_cfg.host, w_cfg.port, desc.id.host, desc.id.port):
+            logger.warning(
+                "Endpoint mismatch for %s: got worker id %s:%s; connection rejected",
+                target,
+                desc.id.host,
+                desc.id.port,
+            )
+            channel.close()
+            wd = WorkerDescriptor(
+                worker_id=WorkerId(host=w_cfg.host, port=w_cfg.port),
+                status=WorkerStatus.OFFLINE,
+                resources=ResourceInfo(cpu_cores=0, ram_total_mb=0, ram_available_mb=0),
+                token_status="ENDPOINT_MISMATCH",
+            )
+            self._registry.upsert(wd)
+            return
+
         wd = _descriptor_from_proto(desc)
         expected = _token_fingerprint(w_cfg.auth_token)
         got = wd.token_fingerprint or ""
@@ -200,6 +242,25 @@ class MasterNode:
             desc = stub.GetStatus(worker_id_pb, timeout=GET_STATUS_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reconnect GetStatus failed for %s: %s", target, exc)
+            channel.close()
+            return False
+
+        logger.info(
+            "GetStatus raw response (reconnect) [target=%s]: id.host=%r id.port=%s status=%s token_fingerprint=%s",
+            target,
+            getattr(desc.id, "host", None),
+            getattr(desc.id, "port", None),
+            getattr(desc, "status", None),
+            getattr(desc, "token_fingerprint", None) or "",
+        )
+
+        if not _endpoint_matches(w_cfg.host, w_cfg.port, desc.id.host, desc.id.port):
+            logger.warning(
+                "Reconnect endpoint mismatch for %s: got worker id %s:%s; reconnect rejected",
+                target,
+                desc.id.host,
+                desc.id.port,
+            )
             channel.close()
             return False
 
@@ -271,9 +332,30 @@ class MasterNode:
 
             try:
                 # Долгоживущий поток; дедлайн не ставим — иначе флаппинг статуса.
-                self._registry.set_status(wid, WorkerStatus.ONLINE)
-                for _ in stub.HealthStream(ping_iterator()):
-                    pass
+                stream = stub.HealthStream(ping_iterator())
+                got_valid_pong = False
+                for pong in stream:
+                    if not _endpoint_matches(wid.host, wid.port, pong.id.host, pong.id.port):
+                        logger.warning(
+                            "HealthStream pong endpoint mismatch for %s: got %s:%s",
+                            worker_key,
+                            pong.id.host,
+                            pong.id.port,
+                        )
+                        raise RuntimeError("health endpoint mismatch")
+                    if not got_valid_pong:
+                        got_valid_pong = True
+                        logger.info(
+                            "HealthPong raw [expected=%s]: id.host=%r id.port=%s status=%s nonce=%s",
+                            worker_key,
+                            getattr(pong.id, "host", None),
+                            getattr(pong.id, "port", None),
+                            getattr(pong, "status", None),
+                            getattr(pong, "nonce", None) or "",
+                        )
+                        self._registry.set_status(wid, WorkerStatus.ONLINE)
+                if not got_valid_pong:
+                    raise RuntimeError("health stream closed without pong")
             except grpc.RpcError as e:
                 logger.warning(
                     "HealthStream обрыв (мастер) %s: code=%s details=%s",
@@ -290,8 +372,8 @@ class MasterNode:
                         ch.close()
                     except Exception:  # noqa: S110
                         pass
-            # RECONNECTING показываем только когда не удаётся переподключиться (см. stub is None).
-            # При обрыве стрима просто переподключаемся без смены статуса — без флаппинга в UI.
+            # После обрыва стрима сразу уходим в RECONNECTING, чтобы не держать ложный ONLINE.
+            self._registry.set_status(wid, WorkerStatus.RECONNECTING)
             time.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, RECONNECT_BACKOFF_MAX_S)
 
